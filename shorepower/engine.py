@@ -1,12 +1,23 @@
 """账务引擎：刻钟窗口归账、版本化整笔更正、进度水位封账、确定性批次发布。
 
-线程模型：只有服务线程调用 :meth:`Engine.process` 写状态；HTTP 查询线程通过
-同一把可重入锁读取，保证查询看到的是已持久化的一致状态。
+线程模型与崩溃一致性：
+
+* 只有服务写线程调用 :meth:`Engine.prepare` / :meth:`Engine.commit`；
+  HTTP 查询线程通过同一把锁读取。
+* :meth:`prepare` 只在**私有暂存状态**上推演，绝不触碰可查询的已提交状态；
+  服务线程随后把整组批次一次 fsync 进批次日志，成功后才调用 :meth:`commit`
+  原子换入。因此写盘卡住或强杀时，查询读到的始终是上一版完整旧账，
+  已对外可见的账必然已持久化，不存在“刚查到的更正消失”。
+* 一条源记录发布的全部批次（如 progress 同时触发的 decision 与 seal）属于
+  同一个提交组，整组同生共死；强杀落在组内会在恢复时整组回滚，源记录从
+  原偏移重新进入流程，封账不会被漏掉，批次序号与无中断回放完全一致。
 """
 
 from __future__ import annotations
 
+import copy
 import threading
+from dataclasses import dataclass
 
 from .model import (
     SCHEMA_VERSION,
@@ -21,7 +32,7 @@ from .model import (
     seal_watermark_progress,
     window_start,
 )
-from .storage import SnapshotStore
+from .storage import BATCHES_NAME, SnapshotStore, recover_committed_batches
 
 
 def _new_window() -> dict:
@@ -29,19 +40,42 @@ def _new_window() -> dict:
     return {"sealed": False, "totals": {}, "contributions": {}}
 
 
+@dataclass
+class LedgerState:
+    """账务的全部可变状态。prepare 时整体深拷贝出私有暂存，commit 时整体换入。"""
+
+    gateways: set
+    progress: dict
+    readings: dict
+    windows: dict
+    committed_offset: int
+    min_meter_ts: int | None
+
+    @classmethod
+    def empty(cls) -> "LedgerState":
+        return cls(set(), {}, {}, {}, -1, None)
+
+    def clone(self) -> "LedgerState":
+        # 深拷贝容器：暂存上的任何修改都不会泄漏到已提交状态（查询视图）
+        return LedgerState(
+            set(self.gateways),
+            dict(self.progress),
+            copy.deepcopy(self.readings),
+            copy.deepcopy(self.windows),
+            self.committed_offset,
+            self.min_meter_ts,
+        )
+
+
 class Engine:
     def __init__(self, snapshot_store: SnapshotStore | None = None):
         self.lock = threading.RLock()
         self.snapshot_store = snapshot_store
-        self.gateways: set[str] = set()
-        self.progress: dict[str, int] = {}
-        # reading_id -> 当前生效版本 {gateway, berth, meter_ts, energy, version, offset}
-        self.readings: dict[str, dict] = {}
-        # window_start -> {sealed, totals{berth: energy}, contributions{rid: {berth, energy}}}
-        self.windows: dict[int, dict] = {}
+        self.state: LedgerState = LedgerState.empty()
+        # 已提交批次（权威顺序与序号），只在 commit 成功后追加
         self.batches: list[dict] = []
-        self.committed_offset = -1
-        self.min_meter_ts: int | None = None
+        # prepare 产出、等待 fsync 的暂存；查询线程永远看不到它
+        self._pending: LedgerState | None = None
         self._since_snapshot = 0
         self.restore()
 
@@ -49,46 +83,71 @@ class Engine:
     def _next_seq(self) -> int:
         return len(self.batches) + 1
 
-    def _publish(self, batch: dict) -> dict:
-        batch["seq"] = self._next_seq()
-        batch.setdefault("schema", SCHEMA_VERSION)
-        self.batches.append(batch)
-        return batch
-
-    def _window(self, start: int) -> dict:
-        win = self.windows.get(start)
+    def _window(self, st: LedgerState, start: int) -> dict:
+        win = st.windows.get(start)
         if win is None:
             win = _new_window()
-            self.windows[start] = win
+            st.windows[start] = win
         return win
 
-    # ------------------------------------------------------------- 主入口
-    def process(self, rec) -> list[dict]:
-        """处理一条已解析记录，返回本次发布的批次（0~2 个，已按发布顺序排列）。
+    # ----------------------------------------------------- 提交流程（核心）
+    def prepare(self, rec) -> list[dict]:
+        """在私有暂存上处理一条记录，返回本次将发布的整组批次（0~2 个）。
 
-        调用方（服务线程）必须按返回顺序把批次 fsync 进批次日志，再处理下一条。
+        本方法不修改任何可查询状态。调用方必须按返回顺序把整组批次一次
+        fsync 进批次日志，再调用 :meth:`commit`；fsync 失败则放弃 commit，
+        已提交状态保持上一版完整旧账不变。
         """
         with self.lock:
+            staged = self.state.clone()
+            batches: list[dict] = []
+
+            def publish(batch: dict) -> dict:
+                batch["seq"] = self._next_seq() + len(batches)
+                batch.setdefault("schema", SCHEMA_VERSION)
+                batches.append(batch)
+                return batch
+
             if isinstance(rec, BadLine):
-                batches = [self._decision_bad(rec)]
+                self._decision_bad(staged, rec, publish)
             elif isinstance(rec, Reading):
-                batches = [self._process_reading(rec)]
+                self._process_reading(staged, rec, publish)
             elif isinstance(rec, Correction):
-                batches = [self._process_correction(rec)]
+                self._process_correction(staged, rec, publish)
             elif isinstance(rec, Progress):
-                batches = [self._process_progress(rec)]
+                self._process_progress(staged, rec, publish)
             else:  # pragma: no cover - 防御
                 raise TypeError(f"未知记录类型: {type(rec)!r}")
-            self.committed_offset = rec.offset
+            staged.committed_offset = rec.offset
             # 进度记录可能推动封账；其它记录只改账不动水位，封账检查统一做也无害
-            seal_batch = self._seal_due_windows(rec.offset)
-            if seal_batch is not None:
-                batches.append(seal_batch)
-            self._since_snapshot += 1
+            self._seal_due_windows(staged, rec.offset, publish)
+            if batches:
+                # 组内最后一个批次打标记：恢复时据此识别完整提交组
+                batches[-1]["group_end"] = True
+            self._pending = staged
             return batches
 
+    def commit(self, batches: list[dict]) -> None:
+        """整组批次 fsync 成功后调用：暂存状态原子换入，批次并入权威列表。"""
+        with self.lock:
+            if self._pending is None:
+                raise RuntimeError("没有待提交的暂存状态（prepare 未执行或已提交）")
+            expected_first = self._next_seq()
+            for i, batch in enumerate(batches):
+                if batch["seq"] != expected_first + i:
+                    raise RuntimeError("提交批次序号与暂存不一致，拒绝换入状态")
+            self.state = self._pending
+            self._pending = None
+            self.batches.extend(batches)
+            self._since_snapshot += 1
+
+    def discard_pending(self) -> None:
+        """fsync 失败时丢弃暂存，已提交状态（完整旧账）原样保留。"""
+        with self.lock:
+            self._pending = None
+
     # ------------------------------------------------------------- reading
-    def _process_reading(self, rec: Reading) -> dict:
+    def _process_reading(self, st: LedgerState, rec: Reading, publish) -> None:
         base = {
             "kind": "decision",
             "source_offset": rec.offset,
@@ -96,8 +155,8 @@ class Engine:
             "reading_id": rec.reading_id,
             "gateway": rec.gateway,
         }
-        if rec.reading_id in self.readings:
-            return self._publish(
+        if rec.reading_id in st.readings:
+            publish(
                 base
                 | {
                     "status": "rejected",
@@ -105,9 +164,10 @@ class Engine:
                     "changes": [],
                 }
             )
+            return
         wstart = window_start(rec.meter_ts)
-        if self.windows.get(wstart, {}).get("sealed"):
-            return self._publish(
+        if st.windows.get(wstart, {}).get("sealed"):
+            publish(
                 base
                 | {
                     "status": "rejected",
@@ -115,16 +175,17 @@ class Engine:
                     "changes": [],
                 }
             )
-        self.gateways.add(rec.gateway)
-        self.min_meter_ts = (
+            return
+        st.gateways.add(rec.gateway)
+        st.min_meter_ts = (
             rec.meter_ts
-            if self.min_meter_ts is None
-            else min(self.min_meter_ts, rec.meter_ts)
+            if st.min_meter_ts is None
+            else min(st.min_meter_ts, rec.meter_ts)
         )
-        win = self._window(wstart)
+        win = self._window(st, wstart)
         win["totals"][rec.berth] = win["totals"].get(rec.berth, 0.0) + rec.energy
         win["contributions"][rec.reading_id] = {"berth": rec.berth, "energy": rec.energy}
-        self.readings[rec.reading_id] = {
+        st.readings[rec.reading_id] = {
             "gateway": rec.gateway,
             "berth": rec.berth,
             "meter_ts": rec.meter_ts,
@@ -141,7 +202,7 @@ class Engine:
             "total": win["totals"][rec.berth],
             "reading_id": rec.reading_id,
         }
-        return self._publish(
+        publish(
             base
             | {
                 "status": "accepted",
@@ -151,7 +212,7 @@ class Engine:
         )
 
     # ------------------------------------------------------------- correction
-    def _process_correction(self, rec: Correction) -> dict:
+    def _process_correction(self, st: LedgerState, rec: Correction, publish) -> None:
         base = {
             "kind": "decision",
             "source_offset": rec.offset,
@@ -159,9 +220,9 @@ class Engine:
             "reading_id": rec.reading_id,
             "version": rec.version,
         }
-        current = self.readings.get(rec.reading_id)
+        current = st.readings.get(rec.reading_id)
         if current is None:
-            return self._publish(
+            publish(
                 base
                 | {
                     "status": "rejected",
@@ -169,8 +230,9 @@ class Engine:
                     "changes": [],
                 }
             )
+            return
         if rec.version <= current["version"]:
-            return self._publish(
+            publish(
                 base
                 | {
                     "status": "rejected",
@@ -181,14 +243,15 @@ class Engine:
                     "changes": [],
                 }
             )
+            return
         old_start = window_start(current["meter_ts"])
         new_start = window_start(rec.meter_ts)
         blocked = []
         for wstart in {old_start, new_start}:
-            if self.windows.get(wstart, {}).get("sealed"):
+            if st.windows.get(wstart, {}).get("sealed"):
                 blocked.append(format_ts(wstart))
         if blocked:
-            return self._publish(
+            publish(
                 base
                 | {
                     "status": "rejected",
@@ -200,11 +263,12 @@ class Engine:
                     "changes": [],
                 }
             )
+            return
 
         # ---- 整笔事务：下面的改动要么全部完成，要么前面已全部校验通过，不会半途失败
         changes: list[dict] = []
         # 1) 从原窗口/原泊位移除
-        old_win = self._window(old_start)
+        old_win = self._window(st, old_start)
         contrib = old_win["contributions"].pop(rec.reading_id)
         old_berth = contrib["berth"]
         old_energy = contrib["energy"]
@@ -223,7 +287,7 @@ class Engine:
             }
         )
         # 2) 落到新窗口/新泊位（窗口或泊位未变时仍成对呈现，保证同批可见完整轨迹）
-        new_win = self._window(new_start)
+        new_win = self._window(st, new_start)
         new_win["totals"][rec.berth] = new_win["totals"].get(rec.berth, 0.0) + rec.energy
         new_win["contributions"][rec.reading_id] = {
             "berth": rec.berth,
@@ -250,15 +314,15 @@ class Engine:
                 "offset": rec.offset,
             }
         )
-        self.min_meter_ts = (
+        st.min_meter_ts = (
             rec.meter_ts
-            if self.min_meter_ts is None
-            else min(self.min_meter_ts, rec.meter_ts)
+            if st.min_meter_ts is None
+            else min(st.min_meter_ts, rec.meter_ts)
         )
         # 确定性顺序：窗口起点、泊位、变更类型（remove 在 add 前）
         order = {"remove": 0, "add": 1, "set": 2}
         changes.sort(key=lambda c: (c["window_start"], c["berth"], order[c["change"]]))
-        return self._publish(
+        publish(
             base
             | {
                 "status": "accepted",
@@ -268,7 +332,7 @@ class Engine:
         )
 
     # ------------------------------------------------------------- progress
-    def _process_progress(self, rec: Progress) -> dict:
+    def _process_progress(self, st: LedgerState, rec: Progress, publish) -> None:
         base = {
             "kind": "decision",
             "source_offset": rec.offset,
@@ -276,9 +340,9 @@ class Engine:
             "gateway": rec.gateway,
             "changes": [],
         }
-        prev = self.progress.get(rec.gateway)
+        prev = st.progress.get(rec.gateway)
         if prev is not None and rec.progress_ts < prev:
-            return self._publish(
+            publish(
                 base
                 | {
                     "status": "rejected",
@@ -288,9 +352,10 @@ class Engine:
                     ),
                 }
             )
-        self.gateways.add(rec.gateway)
-        self.progress[rec.gateway] = rec.progress_ts
-        return self._publish(
+            return
+        st.gateways.add(rec.gateway)
+        st.progress[rec.gateway] = rec.progress_ts
+        publish(
             base
             | {
                 "status": "accepted",
@@ -299,8 +364,8 @@ class Engine:
         )
 
     # ------------------------------------------------------------- bad line
-    def _decision_bad(self, rec: BadLine) -> dict:
-        return self._publish(
+    def _decision_bad(self, st: LedgerState, rec: BadLine, publish) -> None:
+        publish(
             {
                 "kind": "decision",
                 "source_offset": rec.offset,
@@ -312,24 +377,24 @@ class Engine:
         )
 
     # ------------------------------------------------------------- 封账
-    def _all_gateways_reported(self) -> bool:
-        return bool(self.gateways) and self.gateways.issubset(self.progress.keys())
+    def _all_gateways_reported(self, st: LedgerState) -> bool:
+        return bool(st.gateways) and st.gateways.issubset(st.progress.keys())
 
-    def _seal_due_windows(self, trigger_offset: int) -> dict | None:
-        if not self._all_gateways_reported() or self.min_meter_ts is None:
-            return None
-        slowest = min(self.progress.values())
+    def _seal_due_windows(self, st: LedgerState, trigger_offset: int, publish) -> None:
+        if not self._all_gateways_reported(st) or st.min_meter_ts is None:
+            return
+        slowest = min(st.progress.values())
         top = seal_watermark_progress(slowest)
         if top < 0:
-            return None
-        first = window_start(self.min_meter_ts)
+            return
+        first = window_start(st.min_meter_ts)
         sealed_now: list[dict] = []
         wstart = first
         while wstart <= top:
-            win = self.windows.get(wstart)
+            win = st.windows.get(wstart)
             if win is None:
                 win = _new_window()
-                self.windows[wstart] = win
+                st.windows[wstart] = win
             if not win["sealed"]:
                 win["sealed"] = True
                 sealed_now.append(
@@ -341,8 +406,8 @@ class Engine:
                 )
             wstart += WINDOW_SECONDS
         if not sealed_now:
-            return None
-        return self._publish(
+            return
+        publish(
             {
                 "kind": "seal",
                 "trigger_offset": trigger_offset,
@@ -355,11 +420,12 @@ class Engine:
     # ------------------------------------------------------------- 查询
     def query_windows(self, window_ids: list[str] | None = None) -> dict:
         with self.lock:
-            slowest = min(self.progress.values()) if self.progress else None
+            st = self.state
+            slowest = min(st.progress.values()) if st.progress else None
             result = {
                 "seal_grace_seconds": SEAL_GRACE_SECONDS,
                 "slowest_progress": format_ts(slowest) if slowest is not None else None,
-                "all_gateways_reported": self._all_gateways_reported(),
+                "all_gateways_reported": self._all_gateways_reported(st),
                 "windows": [],
             }
             if window_ids:
@@ -369,9 +435,9 @@ class Engine:
                         starts.append(parse_ts(wid, "window"))
                     except Exception:
                         starts.append(None)
-                items = [(s, self.windows.get(s) if s is not None else None) for s in starts]
+                items = [(s, st.windows.get(s) if s is not None else None) for s in starts]
             else:
-                items = sorted(self.windows.items())
+                items = sorted(st.windows.items())
             for wstart, win in items:
                 if wstart is None:
                     result["windows"].append(
@@ -414,16 +480,17 @@ class Engine:
 
     def stats(self, inflight: int = 0) -> dict:
         with self.lock:
-            sealed = sum(1 for w in self.windows.values() if w["sealed"])
+            st = self.state
+            sealed = sum(1 for w in st.windows.values() if w["sealed"])
             return {
                 "published_batches": len(self.batches),
                 "last_seq": self.batches[-1]["seq"] if self.batches else 0,
-                "committed_source_offset": self.committed_offset,
+                "committed_source_offset": st.committed_offset,
                 "inflight_unpersisted": inflight,
-                "known_gateways": sorted(self.gateways),
-                "progress": {g: format_ts(ts) for g, ts in sorted(self.progress.items())},
-                "tracked_readings": len(self.readings),
-                "windows_total": len(self.windows),
+                "known_gateways": sorted(st.gateways),
+                "progress": {g: format_ts(ts) for g, ts in sorted(st.progress.items())},
+                "tracked_readings": len(st.readings),
+                "windows_total": len(st.windows),
                 "windows_sealed": sealed,
             }
 
@@ -437,48 +504,52 @@ class Engine:
         if self.snapshot_store is None:
             return
         with self.lock:
+            st = self.state
             payload = {
                 "schema": SCHEMA_VERSION,
-                "gateways": sorted(self.gateways),
-                "progress": self.progress,
-                "readings": self.readings,
+                "gateways": sorted(st.gateways),
+                "progress": st.progress,
+                "readings": st.readings,
                 "windows": {
                     str(k): {
                         "sealed": v["sealed"],
                         "totals": v["totals"],
                         "contributions": v["contributions"],
                     }
-                    for k, v in self.windows.items()
+                    for k, v in st.windows.items()
                 },
                 "next_seq": len(self.batches) + 1,
-                "committed_offset": self.committed_offset,
-                "min_meter_ts": self.min_meter_ts,
+                "committed_offset": st.committed_offset,
+                "min_meter_ts": st.min_meter_ts,
             }
             self.snapshot_store.write(payload)
             self._since_snapshot = 0
 
     def restore(self) -> None:
-        """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。"""
+        """从快照 + 批次日志重建已提交状态。
+
+        批次日志先经 :func:`recover_committed_batches` 裁掉强杀留下的未完成
+        提交组；快照只可能早于日志，重复回放部分按序号天然跳过。
+        """
         store = self.snapshot_store
         if store is None:
             return
         snap = store.read()
-        # 批次日志与快照同目录
-        from .storage import BATCHES_NAME, iter_jsonl
         import os
 
         jpath = os.path.join(store.directory, BATCHES_NAME)
-        replayed_batches = list(iter_jsonl(jpath)) if os.path.exists(jpath) else []
+        replayed_batches = recover_committed_batches(jpath)
         if snap is None and not replayed_batches:
             return
 
+        st = LedgerState.empty()
         if snap is not None:
             if snap.get("schema") != SCHEMA_VERSION:
                 raise ValueError(f"不支持的快照 schema: {snap.get('schema')!r}")
-            self.gateways = set(snap["gateways"])
-            self.progress = dict(snap["progress"])
-            self.readings = {k: dict(v) for k, v in snap["readings"].items()}
-            self.windows = {
+            st.gateways = set(snap["gateways"])
+            st.progress = dict(snap["progress"])
+            st.readings = {k: dict(v) for k, v in snap["readings"].items()}
+            st.windows = {
                 int(k): {
                     "sealed": v["sealed"],
                     "totals": dict(v["totals"]),
@@ -486,8 +557,8 @@ class Engine:
                 }
                 for k, v in snap["windows"].items()
             }
-            self.committed_offset = snap["committed_offset"]
-            self.min_meter_ts = snap.get("min_meter_ts")
+            st.committed_offset = snap["committed_offset"]
+            st.min_meter_ts = snap.get("min_meter_ts")
             snap_seq = snap["next_seq"] - 1
         else:
             snap_seq = 0
@@ -495,31 +566,33 @@ class Engine:
         for batch in replayed_batches:
             if batch["seq"] <= snap_seq:
                 continue  # 快照已包含
-            self._replay_batch(batch)
-        # 日志永远是权威：内存批次列表与日志保持完全一致
+            self._replay_batch(st, batch)
+        # 日志永远是权威：内存批次列表与日志保持完全一致（去掉组标记不影响重放）
         self.batches = list(replayed_batches)
+        self.state = st
+        self._pending = None
         if replayed_batches:
-            self.committed_offset = max(
-                self.committed_offset,
+            st.committed_offset = max(
+                st.committed_offset,
                 max(
                     b.get("source_offset", b.get("trigger_offset", -1))
                     for b in replayed_batches
                 ),
             )
         # readings 是权威的当前生效版本集合，水位扫描起点直接由其重算
-        if self.readings:
-            self.min_meter_ts = min(r["meter_ts"] for r in self.readings.values())
+        if st.readings:
+            st.min_meter_ts = min(r["meter_ts"] for r in st.readings.values())
 
-    def _replay_batch(self, batch: dict) -> None:
-        """把批次日志中的一条变更重放进内存（不再次发布）。"""
+    def _replay_batch(self, st: LedgerState, batch: dict) -> None:
+        """把批次日志中的一条变更重放进状态（不再次发布）。"""
         kind = batch["kind"]
         if kind == "seal":
             for item in batch["sealed_windows"]:
                 wstart = item["window_start"]
-                win = self.windows.get(wstart)
+                win = st.windows.get(wstart)
                 if win is None:
                     win = _new_window()
-                    self.windows[wstart] = win
+                    st.windows[wstart] = win
                 win["sealed"] = True
                 # 封账时的 totals 是权威冻结值
                 win["totals"] = dict(item["totals"])
@@ -529,8 +602,8 @@ class Engine:
         rtype = batch["record_type"]
         if rtype == "progress" and batch["status"] == "accepted":
             gw, ts_text = next(iter(batch["new_progress"].items()))
-            self.gateways.add(gw)
-            self.progress[gw] = parse_ts(ts_text, "progress_ts")
+            st.gateways.add(gw)
+            st.progress[gw] = parse_ts(ts_text, "progress_ts")
             return
         if batch["status"] != "accepted":
             return  # 驳回 / 坏行：恢复时无账可改
@@ -538,10 +611,10 @@ class Engine:
         if rtype == "reading":
             ch = batch["changes"][0]
             wstart = ch["window_start"]
-            win = self._window(wstart)
+            win = self._window(st, wstart)
             win["totals"][ch["berth"]] = ch["total"]
             win["contributions"][rid] = {"berth": ch["berth"], "energy": ch["energy"]}
-            self.readings[rid] = {
+            st.readings[rid] = {
                 "gateway": batch["gateway"],
                 "berth": ch["berth"],
                 "meter_ts": parse_ts(batch["meter_ts"], "meter_ts"),
@@ -549,11 +622,11 @@ class Engine:
                 "version": 1,
                 "offset": batch["source_offset"],
             }
-            self.gateways.add(batch["gateway"])
+            st.gateways.add(batch["gateway"])
         elif rtype == "correction":
-            current = self.readings[rid]
+            current = st.readings[rid]
             for ch in batch["changes"]:
-                win = self._window(ch["window_start"])
+                win = self._window(st, ch["window_start"])
                 if ch["change"] == "remove":
                     win["contributions"].pop(rid, None)
                     if ch["total"] == 0.0:

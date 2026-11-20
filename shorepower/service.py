@@ -16,7 +16,14 @@ from urllib.parse import parse_qs, urlparse
 
 from .engine import Engine
 from .model import parse_line
-from .storage import BATCHES_NAME, JournalWriter, SnapshotStore, TailReader, dumps_canonical
+from .storage import (
+    BATCHES_NAME,
+    JournalWriter,
+    SnapshotStore,
+    TailReader,
+    dumps_canonical,
+    next_line_start,
+)
 
 
 class _Reader(threading.Thread):
@@ -85,21 +92,14 @@ def _make_handler(engine: Engine, get_inflight: object):
 
 def run_service(args: argparse.Namespace) -> int:
     snapshot_store = SnapshotStore(args.state_dir)
+    # Engine 恢复时会先把批次日志里强杀留下的未完成提交组截断，再打开追加器
     engine = Engine(snapshot_store=snapshot_store)
     journal = JournalWriter(f"{args.state_dir.rstrip('/')}/{BATCHES_NAME}")
 
     # 从上次已提交偏移继续跟读。committed_offset 是记录起始偏移，其行尾换行在
-    # 起始+记录长度处；崩溃时可能已读未处理，续读必须从下一行起点开始，避免重读。
-    start_offset = engine.committed_offset + 1
-    log_path = args.log_file
-    try:
-        with open(log_path, "rb") as fh:
-            fh.seek(start_offset)
-            tail = fh.readline()
-            if tail:
-                start_offset += len(tail)
-    except FileNotFoundError:
-        pass
+    # 起始+记录长度处；崩溃时被截断的未提交组对应记录会“已读未处理”，续读必须
+    # 从下一行起点开始，避免重读。
+    start_offset = next_line_start(args.log_file, engine.state.committed_offset + 1)
     inflight: queue.Queue = queue.Queue(maxsize=args.max_inflight)
     stop = threading.Event()
     reader = _Reader(args.log_file, start_offset, inflight, stop)
@@ -121,9 +121,18 @@ def run_service(args: argparse.Namespace) -> int:
                 rec = inflight.get(timeout=0.2)
             except queue.Empty:
                 continue
-            # 引擎处理与批次落盘在同一线程顺序完成 -> 崩溃后批次精确一次
-            for batch in engine.process(rec):
-                journal.append(batch)
+            # 三段式提交：
+            # 1) prepare 只在私有暂存上推演，查询仍读上一版完整旧账；
+            # 2) 整组批次一次 write+fsync（同条上报的 decision 与 seal 同生共死）；
+            # 3) fsync 成功后才把暂存原子换入可查询状态。
+            batches = engine.prepare(rec)
+            try:
+                journal.append_group(batches)
+            except BaseException:
+                # 落盘失败（如磁盘满/IO 错误）：丢弃暂存，已提交旧账保持不变
+                engine.discard_pending()
+                raise
+            engine.commit(batches)
             engine.maybe_snapshot(args.snapshot_every)
     finally:
         stop.set()

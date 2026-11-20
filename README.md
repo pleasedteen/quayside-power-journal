@@ -19,6 +19,7 @@ SIGKILL 后同目录重启的精确一次恢复。仅用 Python 3.11 标准库�
 | `shorepower/export_parquet.py` | 可选：导出 Parquet（需 `pip install pyarrow`） |
 | `run_*.py` | 各能力的入口脚本，均支持 `python -I` 隔离模式 |
 | `selftest.py` | 端到端自测，80 秒内输出可读结果 |
+| `test_crash_recovery.py` | 写入中/落盘后强杀恢复矩阵：截断规则、续跑、再次重启与无中断回放比对 |
 
 ## 2. 日志格式（每行一个 JSON 对象）
 
@@ -84,13 +85,33 @@ python3 -I run_query.py stats                                     # 含背压队
 
 状态目录下：
 
-- `batches.jsonl`：**权威事实来源**。每发布一个批次即追加并 `flush + fsync`，
-  行内容为确定性 JSON。强杀后已落盘的批次重启后只出现一次。
-- `snapshot.json`：加速恢复的原子快照（tmp + `os.replace`），永远只反映已 fsync 的状态；
-  设 `--snapshot-every 0` 可关闭，完全靠批次日志重放恢复。
+- `batches.jsonl`：**权威事实来源**。一条源记录发布的全部批次构成一个**提交组**
+  （如 progress 同时产出 decision 与 seal 时二者同组），整组拼在同一缓冲区里
+  一次 `write + fsync`，组内最后一个批次带 `"group_end": true` 标记。
+  强杀后已落盘的完整组重启后只出现一次。
+- `snapshot.json`：加速恢复的原子快照（tmp + `os.replace`，替换后 fsync 目录），
+  永远只反映已 fsync 的状态；设 `--snapshot-every 0` 可关闭，完全靠批次日志重放恢复。
 
-恢复时先加载快照（若有），再重放快照之后的批次日志；源日志从「最后提交偏移所在行的
-下一行」继续跟读，因此崩溃时已读未处理的记录会按原规则重新入账或驳回，不会重复发布。
+### 三段式提交（写盘卡住也能读到完整旧账）
+
+写线程对每条记录严格按以下顺序推进，查询线程只读已提交状态：
+
+1. **prepare**：在私有暂存（深拷贝）上推演并生成整组批次，**不触碰可查询状态**；
+2. **落盘**：整组一次 `write + fsync` 进批次日志；失败则丢弃暂存，旧账不变；
+3. **commit**：fsync 成功后才把暂存状态原子换入，批次并入权威列表。
+
+因此：
+
+- 写盘卡住或强杀时，HTTP 查询读到的始终是**上一版完整旧账**——已对外可见的账
+  必然已持久化，不会出现“刚查到的更正消失”；
+- 同一条上报触发的 decision 与 seal 同生共死。强杀落在组内时，恢复逻辑
+  （`recover_committed_batches`）把最后一个 `group_end` 之后的半截行/残缺组
+  物理截断、整组回滚，源记录从原偏移重新进入流程，封账不会被漏掉。
+
+恢复时先加载快照（若有），再重放快照之后、且属于完整提交组的批次；源日志从
+「最后提交偏移所在行的下一行」继续跟读，因此崩溃时已读未处理（含被整组回滚）的
+记录会按原规则重新入账或驳回，不会重复发布。续跑后的批次序号、窗口账、源日志
+续读位置与无中断回放完全一致，完整旧账可直接续用。
 
 ### 手工验证强杀恢复
 
@@ -98,6 +119,16 @@ python3 -I run_query.py stats                                     # 含背压队
 # 服务运行中直接 kill -9，再用同一 --state-dir / --log-file 重启即可
 kill -9 <pid>
 python3 -I run_service.py --log-file ./data/run/gateway.jsonl --state-dir ./data/state
+```
+
+`test_crash_recovery.py` 用环境变量在确定位置注入等价 SIGKILL 的强杀
+（`os._exit`，不跑任何缓冲刷新），覆盖“写入中”和“落盘后”两个时机：
+
+```bash
+SHOREPOWER_CRASH_AT=<第几个提交组> SHOREPOWER_CRASH_MODE=write|fsync \
+  python3 -I run_service.py --log-file ... --state-dir ...
+# 或直接跑完整矩阵（含续跑、再次重启、与无中断回放逐字节比对）
+python3 -I test_crash_recovery.py
 ```
 
 ## 6. 背压
