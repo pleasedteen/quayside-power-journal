@@ -22,9 +22,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))  # -I 模式下不会自动带脚本目录，这里显式加入
 
+from shorepower.engine import Engine  # noqa: E402
 from shorepower.feeder import replay  # noqa: E402
 from shorepower.generator import write_log  # noqa: E402
-from shorepower.storage import dumps_canonical  # noqa: E402
+from shorepower.model import SCHEMA_VERSION, format_ts, parse_line  # noqa: E402
+from shorepower.storage import (  # noqa: E402
+    HISTORY_NAME,
+    INDEX_NAME,
+    SNAPSHOT_NAME,
+    BatchJournal,
+    HistoryStore,
+    SnapshotStore,
+    dumps_canonical,
+)
 
 PASS, FAIL = "✅ 通过", "❌ 失败"
 
@@ -119,6 +129,221 @@ def assert_equal(label: str, a, b) -> None:
     if dumps_canonical(a) != dumps_canonical(b):
         raise AssertionError(f"{label} 不一致\n--- A ---\n{dumps_canonical(a)}\n--- B ---\n{dumps_canonical(b)}")
     print(f"  {PASS} {label}")
+
+
+# ------------------------------------------------------------------ 规模场景辅助
+#
+# 十万批次夹具不通过 HTTP 服务生成（进程级 fsync 太慢），而是直接用引擎 +
+# 批次日志写出与线上完全相同的 state 目录；随后的重启、分页、升级、强杀
+# 都走真实的服务代码路径，只把耗时较长的服务进程换成进程内 Engine。
+
+
+def _scale_records(batches: int):
+    """生成 batches 个 reading 批次的历史（每批次一条读数，含周期进度推进）。"""
+    base = 1_766_428_800  # 2026-11-18T08:00:00Z
+    for i in range(batches):
+        meter = base + i * 900  # 每条落在一个独立的刻钟窗口
+        yield {
+            "type": "reading",
+            "reading_id": f"scale-r{i}",
+            "gateway": "GW1",
+            "berth": f"B{i % 4}",
+            "meter_ts": format_ts(meter),
+            "energy": 1.0,
+        }
+        if i % 40 == 0:
+            # 水位推进到刚过一个窗口，让封账批次也进入历史
+            yield {
+                "type": "progress",
+                "gateway": "GW1",
+                "progress_ts": format_ts(meter + 2 * 900 + 600),
+            }
+
+
+def build_scale_fixture(
+    directory: Path,
+    batches: int,
+    snapshot_every: int = 5000,
+    source_log: Path | None = None,
+) -> None:
+    """用引擎 + 批次日志直接写出规模夹具（与线上相同的目录布局）。
+
+    仅夹具生成阶段关闭逐条 fsync（否则十万条要跑几分钟）；重启、分页、
+    升级、强杀路径全部使用默认的 fsync=True 真实实现。``source_log`` 不为空时
+    同步写出与批次偏移完全对应的源日志，供真实服务进程续读。
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    journal = BatchJournal(str(directory), sync=False)
+    history = HistoryStore(str(directory))
+    engine = Engine(
+        journal=journal,
+        snapshot_store=SnapshotStore(str(directory)),
+        history=history,
+    )
+    src = open(source_log, "w", encoding="utf-8") if source_log is not None else None
+    try:
+        offset = 0
+        for i, rec in enumerate(_scale_records(batches)):
+            line = dumps_canonical(rec) + "\n"
+            if src is not None:
+                src.write(line)
+            journal.append_many(engine.process(parse_line(line, offset)))
+            offset += len(line.encode("utf-8"))
+            if i % snapshot_every == snapshot_every - 1:
+                engine.take_snapshot()
+        engine.take_snapshot()
+    finally:
+        if src is not None:
+            src.flush()
+            os.fsync(src.fileno())
+            src.close()
+        journal.close()
+        history.close()
+
+
+def open_scale_state(directory: Path, auto_snapshot: bool = True) -> dict:
+    """模拟服务重启：真实走 BatchJournal 索引恢复 + Engine.restore，再取 /stats 同款统计。
+
+    返回值里的 ``_engine/_journal/_history`` 仍处于打开状态，由调用方负责
+    :func:`close_scale_state`；只关心统计时可以忽略它们。
+    """
+    journal = BatchJournal(str(directory))
+    history = HistoryStore(str(directory))
+    engine = Engine(
+        journal=journal,
+        snapshot_store=SnapshotStore(str(directory)),
+        history=history,
+        auto_snapshot=auto_snapshot,
+    )
+    stats = engine.stats()
+    stats["journal_bodies_read"] = journal.bodies_read
+    stats["_engine"] = engine
+    stats["_journal"] = journal
+    stats["_history"] = history
+    return stats
+
+
+def close_scale_state(stats: dict) -> None:
+    stats.get("_journal") and stats["_journal"].close()
+    if stats.get("_history") is not None:
+        stats["_history"].close()
+    stats["_engine"] = None
+    stats["_journal"] = None
+    stats["_history"] = None
+
+
+def page_scale_state(directory: Path, after_seq: int, limit: int) -> tuple[list[dict], int]:
+    """按分页接口取一批，返回 (批次, 本进程读取的正文条数)。"""
+    journal = BatchJournal(str(directory))
+    try:
+        page = journal.read_page(after_seq, limit)
+        return page, journal.bodies_read
+    finally:
+        journal.close()
+
+
+def make_legacy_snapshot(directory: Path) -> dict:
+    """把新目录退化成旧状态目录：只保留 batches.jsonl，写一份没有 journal_offset 的旧快照。"""
+    for name in (INDEX_NAME, HISTORY_NAME, SNAPSHOT_NAME):
+        path = directory / name
+        if path.exists():
+            path.unlink()
+    # 先从批次日志重建一次，然后用旧版 schema 快照格式写回
+    journal = BatchJournal(str(directory))
+    try:
+        engine = Engine(journal=journal, snapshot_store=None)
+        legacy_payload = {
+            "schema": SCHEMA_VERSION,
+            "gateways": sorted(engine.gateways),
+            "progress": engine.progress,
+            "readings": engine.readings,
+            "windows": {
+                str(k): {
+                    "sealed": v["sealed"],
+                    "totals": v["totals"],
+                    "contributions": v["contributions"],
+                }
+                for k, v in engine.windows.items()
+            },
+            "next_seq": journal.count + 1,
+            "committed_offset": engine.committed_offset,
+            "min_meter_ts": engine.min_meter_ts,
+        }
+    finally:
+        journal.close()
+    (directory / SNAPSHOT_NAME).write_text(
+        json.dumps(legacy_payload, sort_keys=True), encoding="utf-8"
+    )
+    return legacy_payload
+
+
+def real_kill_after_appending(
+    directory: Path, source_log: Path, work: Path, extra: int
+) -> int:
+    """真实服务进程：追加 extra 个完整批次并确认已 fsync，然后 SIGKILL 再重启对账。"""
+    baseline = BatchJournal(str(directory)).count
+    port = 18096
+    proc = start_service(directory, source_log, port)
+    try:
+        with open(source_log, "a", encoding="utf-8") as dst:
+            for i in range(extra):
+                meter = 1_766_428_800 + (100_000 + 10_000 + i) * 900
+                rec = {
+                    "type": "reading",
+                    "reading_id": f"crash-r{i}",
+                    "gateway": "GW1",
+                    "berth": "B2",
+                    "meter_ts": format_ts(meter),
+                    "energy": 3.0,
+                }
+                dst.write(dumps_canonical(rec) + "\n")
+            dst.flush()
+            os.fsync(dst.fileno())
+        expected = baseline + extra
+        # 等全部追加批次都发布（= 已 fsync 进批次日志）后再强杀
+        wait_until(
+            lambda: http_get(port, "/stats")["published_batches"] >= expected or None,
+            timeout=25,
+        )
+        kill_service(proc)
+    finally:
+        if proc.poll() is None:
+            kill_service(proc)
+
+    # 同目录重启；服务应紧接着已持久化批次继续，不重发、不漏发
+    proc = start_service(directory, source_log, 18097)
+    try:
+        wait_until(
+            lambda: http_get(18097, "/stats")["committed_source_offset"]
+            >= last_line_offset(source_log) - 1 or None,
+            timeout=25,
+        )
+        wait_until(
+            lambda: http_get(18097, "/stats")["published_batches"] >= expected or None,
+            timeout=25,
+        )
+    finally:
+        stop_service(proc)
+    return expected
+
+
+
+def validate_scale_continuity(directory: Path, expected_total: int) -> None:
+    """重启后逐页核对：序号从 1 连续到 expected_total，无重复无空洞。"""
+    seen: list[int] = []
+    after = 0
+    while True:
+        page, _ = page_scale_state(directory, after, 200)
+        if not page:
+            break
+        seen.extend(b["seq"] for b in page)
+        after = page[-1]["seq"]
+    if seen != list(range(1, expected_total + 1)):
+        raise AssertionError(
+            f"批次序号不连续：期望 1..{expected_total}，实际 {seen[:5]}..{seen[-5:]}"
+            f"（共 {len(seen)} 条）"
+        )
+
 
 
 def main() -> int:
@@ -269,6 +494,89 @@ def main() -> int:
                          p2["batches"][0]["seq"], p1["batches"][-1]["seq"] + 1)
         finally:
             stop_service(proc)
+
+        # ------------------------------------------------ 场景 5：十万批次历史
+        print("[场景 5] 十万批次历史夹具：重启只读快照后正文，任意序号取 100 条最多读 200 条")
+        big = work / "scale"
+        build_scale_fixture(big, batches=100_000)
+        # 与不折叠的参照实现比对：折叠/恢复后窗口视图必须完全一致
+        reference = work / "scale_ref"
+        reference.mkdir()
+        shutil.copy(big / "batches.jsonl", reference / "batches.jsonl")
+        ref_journal = BatchJournal(str(reference))
+        ref_engine = Engine(journal=ref_journal)  # 无快照、无归档：纯日志重放
+        ref_windows = ref_engine.query_windows()
+        ref_journal.close()
+        stats_big = open_scale_state(big)
+        try:
+            assert_equal("折叠后窗口视图与纯日志重放逐字节一致",
+                         stats_big["_engine"].query_windows(), ref_windows)
+        finally:
+            close_scale_state(stats_big)
+        # 重启（已有新版快照）：正文读取必须是 0 条
+        assert_equal("重启读取批次正文条数", stats_big["journal_bodies_read"], 0)
+        print(f"  {PASS} 重启：{stats_big['windows_active_in_memory']} 个活动窗口 "
+              f"（归档 {stats_big['windows_archived']} 个）、"
+              f"{stats_big['tracked_readings']} 条活动读数，正文读取 0 条；"
+              f"内存中不驻留任何批次正文")
+
+        # 任意序号取 100 条：正文读取 <= 200 条
+        results = []
+        for after in (0, 1, 999, 50_000, 99_899, 99_900):
+            page, bodies = page_scale_state(big, after, 100)
+            results.append((after, len(page), bodies))
+            if bodies > 200:
+                raise AssertionError(f"after_seq={after} 读取正文 {bodies} 条 > 200")
+            if len(page) != min(100, max(0, 100_000 - after)):
+                raise AssertionError(f"after_seq={after} 分页条数 {len(page)} 不符")
+        print(f"  {PASS} 分页：6 个任意序号各取 100 条，正文读取 "
+              f"{sorted({r[2] for r in results})} 条（上限 200）")
+
+        # 与短历史对比：重启/分页开销不随历史增长
+        small = work / "scale_small"
+        build_scale_fixture(small, batches=500)
+        small_stats = open_scale_state(small)
+        close_scale_state(small_stats)
+        small_page = page_scale_state(small, 0, 100)[1]
+        big_page = page_scale_state(big, 0, 100)[1]
+        print(f"  {PASS} 短历史对比：{small_stats['published_batches']} 条 vs "
+              f"{stats_big['published_batches']} 条，重启正文读取 "
+              f"{small_stats['journal_bodies_read']} vs {stats_big['journal_bodies_read']}，"
+              f"取 100 条正文读取 {small_page} vs {big_page}")
+
+        # 升级路径：删掉新快照与索引，退化成旧状态目录，重启应自动升级且只付一次全量扫描
+        legacy_dir = work / "scale_legacy"
+        legacy_dir.mkdir()
+        shutil.copy(big / "batches.jsonl", legacy_dir / "batches.jsonl")
+        # 用旧版 schema（无 journal_offset）写一份快照
+        old_snapshot = make_legacy_snapshot(legacy_dir)
+        upgrade_stats = open_scale_state(legacy_dir)
+        close_scale_state(upgrade_stats)
+        assert_equal("旧目录快照无 journal_offset", "journal_offset" in old_snapshot, False)
+        assert upgrade_stats["journal_bodies_read"] > 0
+        assert (legacy_dir / SNAPSHOT_NAME).exists()
+        assert_equal("旧目录升级后快照写入 journal_offset",
+                     "journal_offset" in json.loads(
+                         (legacy_dir / SNAPSHOT_NAME).read_text(encoding="utf-8")), True)
+        after_upgrade = open_scale_state(legacy_dir)
+        close_scale_state(after_upgrade)
+        assert_equal("升级后再次重启正文读取条数", after_upgrade["journal_bodies_read"], 0)
+        print(f"  {PASS} 升级：旧快照无 journal_offset，首次重启扫描 "
+              f"{upgrade_stats['journal_bodies_read']} 条正文并升级，之后重启读取 0 条")
+
+        # 追加完整批次后强杀：重启仍能接着对账（真实 SIGKILL，真实 serve 进程）
+        crash_dir = work / "scale_crash"
+        crash_log = work / "scale_crash.log"
+        build_scale_fixture(crash_dir, batches=300, snapshot_every=50,
+                            source_log=crash_log)
+        expected_total = real_kill_after_appending(crash_dir, crash_log, work, extra=37)
+        final = open_scale_state(crash_dir)
+        close_scale_state(final)
+        assert_equal("强杀后批次总数（已发布批次精确一次）",
+                     final["published_batches"], expected_total)
+        validate_scale_continuity(crash_dir, expected_total)
+        print(f"  {PASS} 强杀续对账：追加 {37} 个完整批次后 kill -9，重启批次总数 "
+              f"{final['published_batches']}，序号连续且无重复")
 
     except AssertionError as exc:
         failures += 1

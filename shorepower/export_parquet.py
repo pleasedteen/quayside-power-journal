@@ -14,9 +14,7 @@ import argparse
 import json
 import os
 
-from .model import format_ts
 from .storage import BATCHES_NAME, iter_jsonl
-
 
 def export(state_dir: str, out_prefix: str) -> tuple[str, str]:
     try:
@@ -40,23 +38,37 @@ def export(state_dir: str, out_prefix: str) -> tuple[str, str]:
     else:
         pq.write_table(pa.table({"seq": pa.int64()}), batches_path)
 
-    # 窗口状态从批次日志重放得到，保证与服务视图一致
+    # 窗口状态从批次日志重放得到，保证与服务视图一致；历史归档一并读取，
+    # 否则已被折叠的封账窗口会漏出（也就是 state 目录里的 history.db）
     from .engine import Engine
-    from .storage import SnapshotStore
+    from .storage import BatchJournal, HistoryStore, SnapshotStore
 
-    engine = Engine(snapshot_store=SnapshotStore(state_dir))
+    journal = BatchJournal(state_dir)
+    history = HistoryStore(state_dir)
+    try:
+        engine = Engine(
+            journal=journal,
+            snapshot_store=SnapshotStore(state_dir),
+            history=history,
+        )
+        windows_view = engine.query_windows()["windows"]
+    finally:
+        journal.close()
+        history.close()
     window_rows: list[dict] = []
-    for wstart in sorted(engine.windows):
-        win = engine.windows[wstart]
-        if win["totals"]:
-            for berth, energy in sorted(win["totals"].items()):
+    for win in windows_view:
+        if win.get("error"):
+            continue
+        totals = win["totals"]
+        if totals:
+            for berth, energy in sorted(totals.items()):
                 window_rows.append({
-                    "window": format_ts(wstart), "window_start": wstart,
+                    "window": win["window"], "window_start": win["window_start"],
                     "berth": berth, "energy": energy, "sealed": win["sealed"],
                 })
         else:
             window_rows.append({
-                "window": format_ts(wstart), "window_start": wstart,
+                "window": win["window"], "window_start": win["window_start"],
                 "berth": None, "energy": 0.0, "sealed": win["sealed"],
             })
     windows_path = f"{out_prefix}.windows.parquet"

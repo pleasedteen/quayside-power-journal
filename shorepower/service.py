@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .engine import Engine
 from .model import parse_line
-from .storage import BATCHES_NAME, JournalWriter, SnapshotStore, TailReader, dumps_canonical
+from .storage import BatchJournal, HistoryStore, SnapshotStore, TailReader, dumps_canonical
 
 
 class _Reader(threading.Thread):
@@ -85,8 +85,18 @@ def _make_handler(engine: Engine, get_inflight: object):
 
 def run_service(args: argparse.Namespace) -> int:
     snapshot_store = SnapshotStore(args.state_dir)
-    engine = Engine(snapshot_store=snapshot_store)
-    journal = JournalWriter(f"{args.state_dir.rstrip('/')}/{BATCHES_NAME}")
+    # 打开批次日志时顺带校验/补建磁盘索引；随后引擎只读快照之后的正文
+    journal = BatchJournal(args.state_dir)
+    # 已结算历史的磁盘归档：封账窗口不驻留内存
+    history = HistoryStore(args.state_dir)
+    engine = Engine(
+        journal=journal,
+        snapshot_store=snapshot_store,
+        history=history,
+        # 启用快照时，旧目录升级/首次启动会立即写一份新快照；
+        # --snapshot-every 0 明确要求只靠批次日志重放，则不做自动写入
+        auto_snapshot=args.snapshot_every > 0,
+    )
 
     # 从上次已提交偏移继续跟读。committed_offset 是记录起始偏移，其行尾换行在
     # 起始+记录长度处；崩溃时可能已读未处理，续读必须从下一行起点开始，避免重读。
@@ -122,8 +132,7 @@ def run_service(args: argparse.Namespace) -> int:
             except queue.Empty:
                 continue
             # 引擎处理与批次落盘在同一线程顺序完成 -> 崩溃后批次精确一次
-            for batch in engine.process(rec):
-                journal.append(batch)
+            journal.append_many(engine.process(rec))
             engine.maybe_snapshot(args.snapshot_every)
     finally:
         stop.set()
@@ -131,6 +140,7 @@ def run_service(args: argparse.Namespace) -> int:
         reader.join(timeout=2.0)
         engine.take_snapshot()
         journal.close()
+        history.close()
     return 0
 
 

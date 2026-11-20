@@ -20,7 +20,11 @@ from typing import Any
 WINDOW_SECONDS = 15 * 60
 # 封账宽限：最慢网关水位超过窗口结束 10 分钟后封账
 SEAL_GRACE_SECONDS = 10 * 60
+# 批次日志行的格式版本（影响批次正文内容，保持 1 以免改变既有事实来源）
 SCHEMA_VERSION = 1
+# 快照格式版本：2 起快照额外记录 journal_offset，重启只需读取其后的批次正文；
+# 1 为旧版状态目录（没有 journal_offset），仍可读取并通过二分定位原地升级。
+SNAPSHOT_SCHEMA_VERSION = 2
 
 
 class RecordError(ValueError):
