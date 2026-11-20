@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 
 from .model import (
@@ -21,12 +22,34 @@ from .model import (
     seal_watermark_progress,
     window_start,
 )
-from .storage import SnapshotStore
+from .storage import BATCHES_NAME, SnapshotStore, load_journal
 
 
 def _new_window() -> dict:
     # totals: 泊位 -> 当前电量；contributions: reading_id -> {berth, energy}
     return {"sealed": False, "totals": {}, "contributions": {}}
+
+
+def _record_key(batch: dict) -> tuple[int, int]:
+    """批次所属源记录的身份：同一条记录发布的多个批次共享 (段号, 段内偏移)。
+
+    旧版批次日志没有段号/行号，退化为 (1, 偏移)，仍能逐条区分。
+    """
+    seg = int(batch.get("source_segment", batch.get("trigger_segment", 1)) or 1)
+    off = int(batch.get("source_offset", batch.get("trigger_offset", -1)))
+    return (seg, off)
+
+
+def _count_record_groups(batches: list[dict]) -> int:
+    """已提交源记录条数 = 连续批次按 (段号, 行号) 分组后的组数。"""
+    count = 0
+    prev: tuple[int, int] | None = None
+    for batch in batches:
+        key = _record_key(batch)
+        if key != prev:
+            count += 1
+            prev = key
+    return count
 
 
 class Engine:
@@ -41,6 +64,11 @@ class Engine:
         self.windows: dict[int, dict] = {}
         self.batches: list[dict] = []
         self.committed_offset = -1
+        # 最后一次已提交的来源位置：(段号, 行号, 段内字节偏移)
+        self.committed_segment = 0
+        self.committed_line = 0
+        # 已提交的源记录条数（与批次数不同：一条记录可能带一个封账批次）
+        self.committed_records = 0
         self.min_meter_ts: int | None = None
         self._since_snapshot = 0
         self.restore()
@@ -64,9 +92,11 @@ class Engine:
 
     # ------------------------------------------------------------- 主入口
     def process(self, rec) -> list[dict]:
-        """处理一条已解析记录，返回本次发布的批次（0~2 个，已按发布顺序排列）。
+        """处理一条已解析记录，返回本次发布的批次（1~2 个，已按发布顺序排列）。
 
-        调用方（服务线程）必须按返回顺序把批次 fsync 进批次日志，再处理下一条。
+        调用方（服务线程）必须把返回的批次按顺序一次性 fsync 进批次日志，再处理
+        下一条。返回的每个批次都带有 ``source_segment`` / ``source_line`` /
+        ``source_offset`` 与 ``record_batch_count``，可追溯到唯一的来源段和源行。
         """
         with self.lock:
             if isinstance(rec, BadLine):
@@ -79,11 +109,20 @@ class Engine:
                 batches = [self._process_progress(rec)]
             else:  # pragma: no cover - 防御
                 raise TypeError(f"未知记录类型: {type(rec)!r}")
-            self.committed_offset = rec.offset
             # 进度记录可能推动封账；其它记录只改账不动水位，封账检查统一做也无害
-            seal_batch = self._seal_due_windows(rec.offset)
+            seal_batch = self._seal_due_windows(rec.offset, rec.segment, rec.line)
             if seal_batch is not None:
                 batches.append(seal_batch)
+            # 同一条记录的批次共享来源位置与组大小，便于成组提交/成组恢复
+            for batch in batches:
+                batch["source_segment"] = rec.segment
+                batch["source_line"] = rec.line
+                batch["source_offset"] = rec.offset
+                batch["record_batch_count"] = len(batches)
+            self.committed_offset = rec.offset
+            self.committed_segment = rec.segment
+            self.committed_line = rec.line
+            self.committed_records += 1
             self._since_snapshot += 1
             return batches
 
@@ -315,7 +354,9 @@ class Engine:
     def _all_gateways_reported(self) -> bool:
         return bool(self.gateways) and self.gateways.issubset(self.progress.keys())
 
-    def _seal_due_windows(self, trigger_offset: int) -> dict | None:
+    def _seal_due_windows(
+        self, trigger_offset: int, trigger_segment: int = 0, trigger_line: int = 0
+    ) -> dict | None:
         if not self._all_gateways_reported() or self.min_meter_ts is None:
             return None
         slowest = min(self.progress.values())
@@ -346,6 +387,8 @@ class Engine:
             {
                 "kind": "seal",
                 "trigger_offset": trigger_offset,
+                "trigger_segment": trigger_segment,
+                "trigger_line": trigger_line,
                 "watermark_progress": format_ts(slowest),
                 "grace_seconds": SEAL_GRACE_SECONDS,
                 "sealed_windows": sealed_now,
@@ -419,6 +462,9 @@ class Engine:
                 "published_batches": len(self.batches),
                 "last_seq": self.batches[-1]["seq"] if self.batches else 0,
                 "committed_source_offset": self.committed_offset,
+                "committed_source_segment": self.committed_segment,
+                "committed_source_line": self.committed_line,
+                "committed_records": self.committed_records,
                 "inflight_unpersisted": inflight,
                 "known_gateways": sorted(self.gateways),
                 "progress": {g: format_ts(ts) for g, ts in sorted(self.progress.items())},
@@ -452,23 +498,28 @@ class Engine:
                 },
                 "next_seq": len(self.batches) + 1,
                 "committed_offset": self.committed_offset,
+                "committed_segment": self.committed_segment,
+                "committed_line": self.committed_line,
+                "committed_records": self.committed_records,
                 "min_meter_ts": self.min_meter_ts,
             }
             self.snapshot_store.write(payload)
             self._since_snapshot = 0
 
     def restore(self) -> None:
-        """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。"""
+        """从快照 + 批次日志重建状态。
+
+        批次日志是权威：快照只加速，重放日志里快照之后的完整批次组。日志末尾
+        若留有未提交的残组（掉电/强杀），会被 :func:`load_journal` 丢弃并返回
+        有效字节长度，由服务在启动时截断，避免后续批次追加在残组之后。
+        若快照比日志新（日志被截断），以日志为准回退快照位置。
+        """
         store = self.snapshot_store
         if store is None:
             return
         snap = store.read()
-        # 批次日志与快照同目录
-        from .storage import BATCHES_NAME, iter_jsonl
-        import os
-
         jpath = os.path.join(store.directory, BATCHES_NAME)
-        replayed_batches = list(iter_jsonl(jpath)) if os.path.exists(jpath) else []
+        replayed_batches, _ = load_journal(jpath)
         if snap is None and not replayed_batches:
             return
 
@@ -487,6 +538,9 @@ class Engine:
                 for k, v in snap["windows"].items()
             }
             self.committed_offset = snap["committed_offset"]
+            self.committed_segment = snap.get("committed_segment", 0)
+            self.committed_line = snap.get("committed_line", 0)
+            self.committed_records = snap.get("committed_records", 0)
             self.min_meter_ts = snap.get("min_meter_ts")
             snap_seq = snap["next_seq"] - 1
         else:
@@ -498,14 +552,21 @@ class Engine:
             self._replay_batch(batch)
         # 日志永远是权威：内存批次列表与日志保持完全一致
         self.batches = list(replayed_batches)
+
+        # 已提交位置一律由日志末条批次重算（快照可能因日志尾部残组被丢弃而偏新）
         if replayed_batches:
-            self.committed_offset = max(
-                self.committed_offset,
-                max(
-                    b.get("source_offset", b.get("trigger_offset", -1))
-                    for b in replayed_batches
-                ),
+            self.committed_records = _count_record_groups(replayed_batches)
+            last = replayed_batches[-1]
+            self.committed_segment = int(
+                last.get("source_segment", last.get("trigger_segment", 0)) or 0
             )
+            self.committed_line = int(
+                last.get("source_line", last.get("trigger_line", 0)) or 0
+            )
+            self.committed_offset = int(
+                last.get("source_offset", last.get("trigger_offset", -1))
+            )
+
         # readings 是权威的当前生效版本集合，水位扫描起点直接由其重算
         if self.readings:
             self.min_meter_ts = min(r["meter_ts"] for r in self.readings.values())

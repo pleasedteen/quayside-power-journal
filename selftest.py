@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))  # -I 模式下不会自动带脚本目录，这�
 
 from shorepower.feeder import replay  # noqa: E402
 from shorepower.generator import write_log  # noqa: E402
-from shorepower.storage import dumps_canonical  # noqa: E402
+from shorepower.storage import SegmentWriter, dumps_canonical  # noqa: E402
 
 PASS, FAIL = "✅ 通过", "❌ 失败"
 
@@ -115,10 +115,82 @@ def run_full_replay(work: Path, name: str, port: int, delay: float) -> dict:
         stop_service(proc)
 
 
+def wait_source_done(port: int, total_records: int, timeout: float = 25.0) -> dict:
+    """等待服务把源记录全部处理完（已提交记录数达到源行数）。"""
+    return wait_until(
+        lambda: (lambda s: s if s["committed_records"] >= total_records else None)(
+            http_get(port, "/stats")
+        ),
+        timeout=timeout,
+    )
+
+
+def wait_batch_count(state: Path, expected: int, timeout: float = 25.0) -> list[dict]:
+    """等待批次日志里出现 expected 个批次（用于分段布局的处理进度判定）。"""
+    return wait_until(
+        lambda: (lambda b: b if len(b) == expected else None)(
+            read_jsonl(state / "batches.jsonl")
+        ),
+        timeout=timeout,
+    )
+
+
+def run_segment_replay(work: Path, name: str, port: int, total_records: int) -> dict:
+    """用命令行回放器按编号分段（每段 10 行）写出，再让服务跟读同一个段前缀。"""
+    state = work / f"{name}_state"
+    base = work / name
+    state.mkdir(parents=True)
+    proc = start_service(state, base, port)
+    try:
+        replay(str(work / "mock.jsonl"), str(base), delay=0.0, segment_lines=10)
+        wait_source_done(port, total_records)
+        batches = read_jsonl(state / "batches.jsonl")
+        windows = http_get(port, "/windows")
+        stats = http_get(port, "/stats")
+        return {"batches": batches, "windows": windows, "stats": stats,
+                "raw_batches": (state / "batches.jsonl").read_text(encoding="utf-8")}
+    finally:
+        stop_service(proc)
+
+
 def assert_equal(label: str, a, b) -> None:
     if dumps_canonical(a) != dumps_canonical(b):
         raise AssertionError(f"{label} 不一致\n--- A ---\n{dumps_canonical(a)}\n--- B ---\n{dumps_canonical(b)}")
     print(f"  {PASS} {label}")
+
+
+LOCATION_KEYS = ("source_segment", "source_line", "source_offset",
+                 "trigger_segment", "trigger_line", "trigger_offset")
+
+
+def strip_location(batches: list[dict]) -> list[dict]:
+    """去掉来源定位字段后的批次视图，用于跨布局比较业务结果。"""
+    return [{k: v for k, v in b.items() if k not in LOCATION_KEYS} for b in batches]
+
+
+def assert_locations_trace(batches: list[dict], seg_files: list[Path], label: str) -> None:
+    """校验每个决定批次都能回溯到真实源行，且段序/行序严格递增。"""
+    source: list[tuple[int, int, str]] = []
+    for path in seg_files:
+        num = int(path.name.split(".")[-1])
+        for idx, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            source.append((num, idx, line))
+    decisions = [b for b in batches if b["kind"] == "decision"]
+    assert_equal(f"{label}：决定批次数等于源行数", len(decisions), len(source))
+    got = [(b["source_segment"], b["source_line"]) for b in decisions]
+    assert_equal(f"{label}：批次按段号+行序严格递增且与源文件逐行对应",
+                 got, [(n, i) for n, i, _ in source])
+
+    bad: list[int] = []
+    for batch, (_, _, raw) in zip(decisions, source):
+        if batch["record_type"] == "bad":
+            continue  # 坏行批次只要能定位到源行即可，内容本就不可解析
+        obj = json.loads(raw)
+        if obj.get("type") != batch["record_type"]:
+            bad.append(batch["seq"])
+        elif obj.get("reading_id") != batch.get("reading_id"):
+            bad.append(batch["seq"])
+    assert_equal(f"{label}：来源行内容与批次类型/主键一致", bad, [])
 
 
 def main() -> int:
@@ -267,6 +339,125 @@ def main() -> int:
             p2 = http_get(18095, f"/batches?after_seq={p1['batches'][-1]['seq']}&limit=5")
             assert_equal("批次分页序号衔接",
                          p2["batches"][0]["seq"], p1["batches"][-1]["seq"] + 1)
+        finally:
+            stop_service(proc)
+
+        # ------------------------------------------------ 场景 5：分段跟读与来源追溯
+        print("[场景 5] 网关编号分段（每段 10 行，写完即封存）：业务结果与单文件一致，且每批可追到来源段/源行")
+        seg = run_segment_replay(work, "seg", 18096, total_records=n)
+        assert_equal("分段跟读业务结果（除来源定位外）与单文件一致",
+                     strip_location(seg["batches"]), strip_location(fast["batches"]))
+        assert_equal("分段跟读窗口状态与单文件一致", seg["windows"], fast["windows"])
+        segs_seen = sorted({b["source_segment"] for b in seg["batches"]})
+        assert_equal("批次覆盖全部 5 个来源段", segs_seen, [1, 2, 3, 4, 5])
+        seg_files = sorted(work.glob("seg.[0-9][0-9][0-9][0-9][0-9][0-9]"))
+        assert_locations_trace(seg["batches"], seg_files, "来源追溯")
+
+        # 单文件布局的来源定位：段号恒为 1，行号即文件行序
+        assert_equal("单文件布局来源段号恒为 1",
+                     sorted({b["source_segment"] for b in fast["batches"]}), [1])
+        src_lines = (work / "fast.log").read_text(encoding="utf-8").splitlines()
+        assert_equal("单文件布局行号与文件行序一一对应",
+                     [b["source_line"] for b in fast["batches"] if b["kind"] == "decision"],
+                     list(range(1, len(src_lines) + 1)))
+
+        # ------------------------------------------------ 场景 6：换段前强杀
+        print("[场景 6] 换段前 SIGKILL 重启：批次顺序/来源/窗口与连续分段运行一致")
+        pre_state = work / "pre_state"
+        pre_base = work / "pre_seg"
+        pre_state.mkdir()
+        pre_lines = (work / "mock.jsonl").read_text(encoding="utf-8").splitlines(keepends=True)
+        w = SegmentWriter(str(pre_base))
+        for line in pre_lines[:10]:          # 换段前：只有第 1 段（10 行，已封存）
+            w.append(line)
+        w.mark_sealed()
+        proc = start_service(pre_state, pre_base, 18097)
+        try:
+            wait_batch_count(pre_state, 10)  # 前 10 行记录各发布 1 个批次（尚无封账）
+            stats_b = http_get(18097, "/stats")
+            assert_equal("换段前：提交位置停在第 1 段第 10 行",
+                         (stats_b["committed_source_segment"], stats_b["committed_source_line"]),
+                         (1, 10))
+            kill_service(proc)               # 换段前强杀
+        finally:
+            if proc.poll() is None:
+                kill_service(proc)
+        # 网关继续按每 10 行换段写第 2..5 段并封存（与场景 5 的分段方案完全相同）
+        for chunk_start in (10, 20, 30, 40):
+            w.open_next_segment()
+            for line in pre_lines[chunk_start:chunk_start + 10]:
+                w.append(line)
+            w.mark_sealed()
+        w.detach()
+
+        proc = start_service(pre_state, pre_base, 18098)
+        try:
+            wait_batch_count(pre_state, len(seg["batches"]))
+            after = read_jsonl(pre_state / "batches.jsonl")
+            assert_equal("换段前崩溃恢复：批次内容/顺序/来源与连续分段运行逐字节一致",
+                         [json.dumps(b, sort_keys=True) for b in after],
+                         [json.dumps(b, sort_keys=True) for b in seg["batches"]])
+            assert_equal("换段前崩溃恢复：窗口与连续分段运行一致",
+                         http_get(18098, "/windows"), seg["windows"])
+            assert_equal("换段前崩溃恢复：批次序号无重复无空洞",
+                         [b["seq"] for b in after], list(range(1, len(after) + 1)))
+        finally:
+            stop_service(proc)
+
+        # ------------------------------------------------ 场景 7：换段后强杀（旧段仍积压）
+        print("[场景 7] 换段后 SIGKILL（新段已到、旧段仍有积压）：不越段，重启后按段序/行序补齐")
+        post_state = work / "post_state"
+        post_base = work / "post_seg"
+        post_state.mkdir()
+        w = SegmentWriter(str(post_base))
+        for line in pre_lines[:10]:          # 第 1 段 10 行，暂不封存
+            w.append(line)
+        w.open_next_segment()                # 新段已到，旧段仍未封存 -> 旧段积压
+        for line in pre_lines[10:20]:
+            w.append(line)
+        w.detach()
+
+        proc = start_service(post_state, post_base, 18099)
+        try:
+            wait_batch_count(post_state, 10)   # 第 1 段 10 行记录，尚无封账
+            time.sleep(0.6)                  # 给越段读取留出机会，若发生则批次会变多
+            stats_1 = http_get(18099, "/stats")
+            assert_equal("旧段未封存时不越段读取", stats_1["committed_source_segment"], 1)
+            assert_equal("旧段积压已读尽（第 1 段 10 行）", stats_1["committed_source_line"], 10)
+            assert_equal("未越段时批次总数不增", len(read_jsonl(post_state / "batches.jsonl")), 10)
+            kill_service(proc)               # 换段后强杀
+        finally:
+            if proc.poll() is None:
+                kill_service(proc)
+
+        # 网关恢复：封存第 1 段，续写第 2 段（含 11..20 行）并封存，再切出第 3 段
+        w = SegmentWriter(str(post_base))    # 接在第 2 段继续写
+        w.seal_segment(1)
+        for line in pre_lines[20:30]:
+            w.append(line)
+        w.mark_sealed()                      # 封存第 2 段（共 20 行）
+        w.open_next_segment()
+        for line in pre_lines[30:]:
+            w.append(line)
+        w.mark_sealed()                      # 封存第 3 段
+        w.detach()
+
+        proc = start_service(post_state, post_base, 18100)
+        try:
+            wait_batch_count(post_state, len(seg["batches"]))
+            final = read_jsonl(post_state / "batches.jsonl")
+            assert_equal("换段后崩溃恢复：业务结果与连续运行一致",
+                         strip_location(final), strip_location(seg["batches"]))
+            assert_equal("换段后崩溃恢复：窗口与连续运行一致",
+                         http_get(18100, "/windows"), seg["windows"])
+            assert_equal("换段后崩溃恢复：批次序号无重复无空洞",
+                         [b["seq"] for b in final], list(range(1, len(final) + 1)))
+            assert_locations_trace(
+                final, sorted(work.glob("post_seg.[0-9][0-9][0-9][0-9][0-9][0-9]")), "换段后来源追溯")
+            stats_f = http_get(18100, "/stats")
+            assert_equal("换段后崩溃恢复：已提交到最后一个来源段末行",
+                         (stats_f["committed_source_segment"], stats_f["committed_source_line"]),
+                         (3, len(pre_lines[30:])))
         finally:
             stop_service(proc)
 

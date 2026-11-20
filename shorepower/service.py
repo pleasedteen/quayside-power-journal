@@ -1,5 +1,12 @@
 """服务装配：源日志跟读线程 + 单写线程账务引擎 + 本地 HTTP 查询接口。
 
+源日志可以是单文件，也可以是网关按编号滚动出的多段（见 :mod:`storage`）。
+跟读线程统一交给 :class:`~shorepower.storage.SourceReader`：
+
+* 严格按段号升序、段内行序升序读取；上一段即使写完了、下一段已经出现，
+  也先把上一段**已封存**范围内的积压读尽才换段（未封存则等待，不能越段）。
+* 每行带上来源 ``(段号, 行号, 段内偏移)``，随批次一起持久化并对外可查。
+
 背压语义：源日志行先进入容量为 ``max_inflight`` 的有界队列；下游发布变慢时，
 跟读线程在 ``put`` 处阻塞，使“已读但尚未持久处理”的记录数始终不超过该上限。
 """
@@ -7,42 +14,81 @@
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import queue
 import signal
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .engine import Engine
 from .model import parse_line
-from .storage import BATCHES_NAME, JournalWriter, SnapshotStore, TailReader, dumps_canonical
+from .storage import (
+    BATCHES_NAME,
+    JournalWriter,
+    SnapshotStore,
+    SourceReader,
+    dumps_canonical,
+    load_journal,
+)
 
 
 class _Reader(threading.Thread):
-    def __init__(self, path: str, start_offset: int, out: queue.Queue, stop: threading.Event):
+    def __init__(
+        self,
+        path: str,
+        layout: str,
+        resume: tuple[int, int, int] | None,
+        out: queue.Queue,
+        stop: threading.Event,
+    ):
         super().__init__(name="log-reader", daemon=True)
-        self.tail = TailReader(path, start_offset=start_offset)
+        self.source = SourceReader(path, layout=layout, resume=resume)
         self.out = out
         self.stop = stop
+        self.error: BaseException | None = None
 
     def run(self) -> None:
         try:
             while not self.stop.is_set():
-                line = self.tail.readline()
-                if line is None:
-                    self.stop.wait(self.tail.poll_interval)
+                item = self.source.readline()
+                if item is None:
+                    self.stop.wait(self.source.poll_interval)
                     continue
-                offset = self.tail.offset - len(line.encode("utf-8"))
-                rec = parse_line(line, offset=offset)
+                segment, line_no, offset, raw = item
+                rec = parse_line(
+                    raw, offset=offset, segment=segment, line_no=line_no
+                )
                 self.out.put(rec)  # 有界队列：下游慢时在这里阻塞，形成背压
+        except BaseException as exc:  # 源日志被截断/改写等致命错误
+            self.error = exc
+            self.stop.set()
         finally:
-            self.tail.close()
+            self.source.close()
+
+
+def _repair_journal_tail(path: str) -> None:
+    """启动时按「完整批次组」校验批次日志，把末尾未提交的残组截掉。
+
+    正常 SIGKILL 下每行写入后即 fsync、且一条记录的批次是一次 write，
+    不会出现半组；这里仍做防御性校验，保证追加位置永远落在组边界上。
+    """
+    _, valid_bytes = load_journal(path)
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    if valid_bytes >= size:
+        return
+    with open(path, "r+b") as fh:
+        fh.truncate(valid_bytes)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def _make_handler(engine: Engine, get_inflight: object):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "ShorePowerLedger/1.0"
+        server_version = "ShorePowerLedger/1.1"
 
         def log_message(self, fmt, *args):  # 安静些，日志走批次文件
             return
@@ -86,23 +132,20 @@ def _make_handler(engine: Engine, get_inflight: object):
 def run_service(args: argparse.Namespace) -> int:
     snapshot_store = SnapshotStore(args.state_dir)
     engine = Engine(snapshot_store=snapshot_store)
-    journal = JournalWriter(f"{args.state_dir.rstrip('/')}/{BATCHES_NAME}")
+    journal_path = os.path.join(args.state_dir, BATCHES_NAME)
+    # 恢复时若发现末尾残组，先截断再打开追加器
+    os.makedirs(args.state_dir, exist_ok=True)
+    _repair_journal_tail(journal_path)
+    journal = JournalWriter(journal_path)
 
-    # 从上次已提交偏移继续跟读。committed_offset 是记录起始偏移，其行尾换行在
-    # 起始+记录长度处；崩溃时可能已读未处理，续读必须从下一行起点开始，避免重读。
-    start_offset = engine.committed_offset + 1
-    log_path = args.log_file
-    try:
-        with open(log_path, "rb") as fh:
-            fh.seek(start_offset)
-            tail = fh.readline()
-            if tail:
-                start_offset += len(tail)
-    except FileNotFoundError:
-        pass
+    # 从最后一次已提交的 (段号, 行号, 段内偏移) 继续：SourceReader 会跳过该行。
+    # 旧版批次日志只有偏移（段号/行号为 0），也照此续读并按偏移反推行号。
+    resume = None
+    if engine.committed_offset >= 0:
+        resume = (engine.committed_segment or 1, engine.committed_line, engine.committed_offset)
     inflight: queue.Queue = queue.Queue(maxsize=args.max_inflight)
     stop = threading.Event()
-    reader = _Reader(args.log_file, start_offset, inflight, stop)
+    reader = _Reader(args.log_file, args.log_layout, resume, inflight, stop)
     reader.start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(engine, inflight.qsize))
@@ -121,9 +164,9 @@ def run_service(args: argparse.Namespace) -> int:
                 rec = inflight.get(timeout=0.2)
             except queue.Empty:
                 continue
-            # 引擎处理与批次落盘在同一线程顺序完成 -> 崩溃后批次精确一次
-            for batch in engine.process(rec):
-                journal.append(batch)
+            # 引擎处理与批次落盘在同一线程顺序完成 -> 崩溃后批次精确一次；
+            # 一条记录的全部批次一次写入并 fsync，保证不会只持久化半组
+            journal.append_many(engine.process(rec))
             engine.maybe_snapshot(args.snapshot_every)
     finally:
         stop.set()
@@ -131,6 +174,10 @@ def run_service(args: argparse.Namespace) -> int:
         reader.join(timeout=2.0)
         engine.take_snapshot()
         journal.close()
+    if reader.error is not None:
+        # 源日志不可继续跟读（截断/改写/恢复点缺失）：明确失败，不静默错位
+        print(f"源日志跟读失败: {reader.error}", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -139,7 +186,23 @@ def build_parser() -> argparse.ArgumentParser:
         prog="shorepower-service",
         description="港口岸电刻钟窗口电量跟读服务（JSON Lines 本地持久化，可崩溃恢复）",
     )
-    p.add_argument("--log-file", required=True, help="待跟读的电表网关 JSON Lines 日志路径")
+    p.add_argument(
+        "--log-file",
+        required=True,
+        help=(
+            "待跟读的电表网关 JSON Lines 路径。单文件布局直接读该文件；"
+            "分段布局下作为段前缀 <前缀>.000001 等"
+        ),
+    )
+    p.add_argument(
+        "--log-layout",
+        choices=("auto", "file", "segments"),
+        default="auto",
+        help=(
+            "源日志布局：auto=存在 <前缀>.NNNNNN 段文件则按编号分段读，否则按单文件读；"
+            "file=强制单文件；segments=强制编号分段（默认 auto）"
+        ),
+    )
     p.add_argument("--state-dir", required=True, help="批次日志/快照等恢复数据目录")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)

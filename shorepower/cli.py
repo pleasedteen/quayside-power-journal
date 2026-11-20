@@ -37,22 +37,32 @@ def _print_windows(payload: dict) -> None:
         print(f"  {w['window']}  [{mark}]  合计={w['total_energy']}  分泊位: {details}")
 
 
+def _src(b: dict) -> str:
+    """把批次的来源定位渲染成 ``s<段号>:<行号>``（单文件布局为 s1:行号）。"""
+    seg = b.get("source_segment", b.get("trigger_segment"))
+    line = b.get("source_line", b.get("trigger_line"))
+    if seg is None and line is None:
+        return "-"
+    return f"s{seg}:{line}"
+
+
 def _print_batches(payload: dict) -> None:
     print(f"after_seq={payload['after_seq']}  last_seq={payload['last_seq']}  "
-          f"本批返回 {len(payload['batches'])} 条")
+          f"本批返回 {len(payload['batches'])} 条  （来源 s段号:行号）")
     for b in payload["batches"]:
         if b["kind"] == "seal":
             wins = ", ".join(w["window"] for w in b["sealed_windows"])
-            print(f"  #{b['seq']:>4} SEAL   触发偏移={b['trigger_offset']} "
+            print(f"  #{b['seq']:>4} SEAL   来源={_src(b):<9} 段内偏移={b['trigger_offset']} "
                   f"水位={b['watermark_progress']}(+{b['grace_seconds']}s) 封账: {wins}")
             continue
         status = b["status"].upper()
         if b["record_type"] == "bad":
-            print(f"  #{b['seq']:>4} {status:<8} 坏行 偏移={b['source_offset']} 原因: {b['reason']}")
+            print(f"  #{b['seq']:>4} {status:<8} 来源={_src(b):<9} 坏行 段内偏移={b['source_offset']} "
+                  f"原因: {b['reason']}")
             continue
         rid = b.get("reading_id", "-")
-        print(f"  #{b['seq']:>4} {status:<8} {b['record_type']:<10} id={rid} "
-              f"偏移={b['source_offset']}" + (f" v{b['version']}" if "version" in b else ""))
+        print(f"  #{b['seq']:>4} {status:<8} 来源={_src(b):<9} {b['record_type']:<10} id={rid} "
+              f"段内偏移={b['source_offset']}" + (f" v{b['version']}" if "version" in b else ""))
         if b["status"] == "rejected":
             print(f"           驳回原因: {b['reason']}")
         for ch in b.get("changes", []):

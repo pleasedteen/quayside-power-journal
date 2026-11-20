@@ -15,7 +15,7 @@ import json
 import os
 
 from .model import format_ts
-from .storage import BATCHES_NAME, iter_jsonl
+from .storage import BATCHES_NAME, load_journal
 
 
 def export(state_dir: str, out_prefix: str) -> tuple[str, str]:
@@ -29,7 +29,8 @@ def export(state_dir: str, out_prefix: str) -> tuple[str, str]:
         ) from exc
 
     batch_rows: list[dict] = []
-    for batch in iter_jsonl(os.path.join(state_dir, BATCHES_NAME)):
+    journal_batches, _ = load_journal(os.path.join(state_dir, BATCHES_NAME))
+    for batch in journal_batches:
         row = {k: json.dumps(v, ensure_ascii=False, sort_keys=True)
                if isinstance(v, (dict, list)) else v
                for k, v in batch.items()}

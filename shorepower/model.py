@@ -79,7 +79,10 @@ class Reading:
     berth: str
     meter_ts: int
     energy: float
-    offset: int = -1  # 由读取线程回填：源日志行偏移，不参与业务语义
+    # 以下由读取线程回填：来源段号、段内行号、段内字节偏移，不参与业务语义
+    offset: int = -1
+    segment: int = 0
+    line: int = 0
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,8 @@ class Correction:
     meter_ts: int
     energy: float
     offset: int = -1
+    segment: int = 0
+    line: int = 0
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,8 @@ class Progress:
     gateway: str
     progress_ts: int
     offset: int = -1
+    segment: int = 0
+    line: int = 0
 
 
 @dataclass(frozen=True)
@@ -105,6 +112,8 @@ class BadLine:
     raw: str
     reason: str
     offset: int = -1
+    segment: int = 0
+    line: int = 0
 
 
 def _require_number(obj: dict, key: str) -> float:
@@ -123,17 +132,29 @@ def _require_str(obj: dict, key: str) -> str:
     return value
 
 
-def parse_line(raw_line: str, offset: int = -1) -> Reading | Correction | Progress | BadLine:
-    """解析一行日志。任何结构问题都转成 BadLine，绝不抛给调用方。"""
-    line = raw_line.strip()
-    if not line:
-        return BadLine(raw=raw_line, reason="空行", offset=offset)
+def parse_line(
+    raw_line: str,
+    offset: int = -1,
+    segment: int = 0,
+    line_no: int = 0,
+) -> Reading | Correction | Progress | BadLine:
+    """解析一行日志。任何结构问题都转成 BadLine，绝不抛给调用方。
+
+    ``segment`` / ``line_no`` 是该行在源日志中的来源段号与段内行号（均从 1 起），
+    由读取线程回填，用于把每条发布批次追溯回具体的来源段和源行。
+    """
+    text = raw_line.strip()
+    if not text:
+        return BadLine(raw=raw_line, reason="空行", offset=offset,
+                       segment=segment, line=line_no)
     try:
-        obj = json.loads(line)
+        obj = json.loads(text)
     except ValueError as exc:
-        return BadLine(raw=raw_line, reason=f"JSON 解析失败: {exc}", offset=offset)
+        return BadLine(raw=raw_line, reason=f"JSON 解析失败: {exc}", offset=offset,
+                       segment=segment, line=line_no)
     if not isinstance(obj, dict):
-        return BadLine(raw=raw_line, reason="日志行必须是 JSON 对象", offset=offset)
+        return BadLine(raw=raw_line, reason="日志行必须是 JSON 对象", offset=offset,
+                       segment=segment, line=line_no)
     kind = obj.get("type")
     try:
         if kind == "reading":
@@ -163,6 +184,7 @@ def parse_line(raw_line: str, offset: int = -1) -> Reading | Correction | Progre
         else:
             raise RecordError(f"未知 type: {kind!r}")
     except RecordError as exc:
-        return BadLine(raw=raw_line, reason=str(exc), offset=offset)
-    # 冻结 dataclass 的 offset 回填
-    return replace(rec, offset=offset)
+        return BadLine(raw=raw_line, reason=str(exc), offset=offset,
+                       segment=segment, line=line_no)
+    # 冻结 dataclass 的来源定位字段回填
+    return replace(rec, offset=offset, segment=segment, line=line_no)
