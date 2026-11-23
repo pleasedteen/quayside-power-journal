@@ -87,7 +87,13 @@ class SnapshotStore:
 
 
 class TailReader:
-    """对单个 JSON Lines 文件做 ``tail -F`` 式跟读，支持被截断/重建后从头跟随。"""
+    """对单个 JSON Lines 文件做二进制 ``tail -F`` 式跟读，支持被截断/重建后从头跟随。
+
+    * 按原始字节切行：只有读到 ``b"\\n"`` 才认为一行完整。UTF-8 多字节字符被
+      拆开追加时，半个字符所在的分片不含换行符，绝不会被提前按行处理。
+    * ``self.offset`` 始终是文件原始字节偏移——空行、CRLF、非 ASCII 字符都按
+      字节计，与文本模式的换行翻译/解码缓冲完全无关。
+    """
 
     def __init__(self, path: str, start_offset: int = 0, poll_interval: float = 0.05):
         self.path = path
@@ -97,7 +103,7 @@ class TailReader:
         self._inode = None
 
     def _open(self) -> None:
-        self._fh = open(self.path, "r", encoding="utf-8")
+        self._fh = open(self.path, "rb")
         self._fh.seek(self.offset)
         self._inode = os.fstat(self._fh.fileno()).st_ino
 
@@ -117,8 +123,8 @@ class TailReader:
             return True
         return False
 
-    def readline(self) -> str | None:
-        """返回下一行（含换行符也可）；暂无数据返回 None。"""
+    def readline(self) -> bytes | None:
+        """返回下一行原始字节（含结尾的 ``b"\\n"``）；暂无完整行返回 None。"""
         if self._fh is None:
             if not os.path.exists(self.path):
                 return None
@@ -126,10 +132,10 @@ class TailReader:
         else:
             self._reopen_if_rotated()
         line = self._fh.readline()
-        if line == "":
+        if line == b"":
             return None
-        # readline 可能读到未写完的半截行（结尾无 \n）：退回偏移等下次
-        if not line.endswith("\n"):
+        # 行未写完（结尾还没有 \n，多字节字符也可能只到了半个）：退回偏移等下次
+        if not line.endswith(b"\n"):
             self._fh.seek(self.offset)
             return None
         self.offset = self._fh.tell()

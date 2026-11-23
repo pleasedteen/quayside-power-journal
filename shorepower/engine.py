@@ -41,6 +41,9 @@ class Engine:
         self.windows: dict[int, dict] = {}
         self.batches: list[dict] = []
         self.committed_offset = -1
+        # 续读位置：最后已落盘记录行尾的下一字节偏移（= 下一行起点）。
+        # 0 表示全新日志从头读；None 表示旧版(schema 1)状态未记录，需启动时换算一次。
+        self.resume_offset: int | None = 0
         self.min_meter_ts: int | None = None
         self._since_snapshot = 0
         self.restore()
@@ -80,10 +83,16 @@ class Engine:
             else:  # pragma: no cover - 防御
                 raise TypeError(f"未知记录类型: {type(rec)!r}")
             self.committed_offset = rec.offset
+            if rec.end_offset >= 0:
+                self.resume_offset = rec.end_offset
             # 进度记录可能推动封账；其它记录只改账不动水位，封账检查统一做也无害
             seal_batch = self._seal_due_windows(rec.offset)
             if seal_batch is not None:
                 batches.append(seal_batch)
+            # 每个批次都带上下一条记录的起始字节偏移：崩溃后凭批次日志即可
+            # 直接定位续读位置，无需回读上一行正文（旧版批次无此字段，见 restore）
+            for batch in batches:
+                batch["next_offset"] = rec.end_offset
             self._since_snapshot += 1
             return batches
 
@@ -419,6 +428,7 @@ class Engine:
                 "published_batches": len(self.batches),
                 "last_seq": self.batches[-1]["seq"] if self.batches else 0,
                 "committed_source_offset": self.committed_offset,
+                "resume_source_offset": self.resume_offset,
                 "inflight_unpersisted": inflight,
                 "known_gateways": sorted(self.gateways),
                 "progress": {g: format_ts(ts) for g, ts in sorted(self.progress.items())},
@@ -452,6 +462,7 @@ class Engine:
                 },
                 "next_seq": len(self.batches) + 1,
                 "committed_offset": self.committed_offset,
+                "resume_offset": self.resume_offset,
                 "min_meter_ts": self.min_meter_ts,
             }
             self.snapshot_store.write(payload)
@@ -472,9 +483,12 @@ class Engine:
         if snap is None and not replayed_batches:
             return
 
+        # 续读位置先按未知处理；schema>=2 的快照或含 next_offset 的批次会填上
+        self.resume_offset = None
         if snap is not None:
-            if snap.get("schema") != SCHEMA_VERSION:
-                raise ValueError(f"不支持的快照 schema: {snap.get('schema')!r}")
+            snap_schema = snap.get("schema")
+            if snap_schema not in (1, SCHEMA_VERSION):
+                raise ValueError(f"不支持的快照 schema: {snap_schema!r}")
             self.gateways = set(snap["gateways"])
             self.progress = dict(snap["progress"])
             self.readings = {k: dict(v) for k, v in snap["readings"].items()}
@@ -488,6 +502,8 @@ class Engine:
             }
             self.committed_offset = snap["committed_offset"]
             self.min_meter_ts = snap.get("min_meter_ts")
+            if snap_schema >= 2:
+                self.resume_offset = snap.get("resume_offset")
             snap_seq = snap["next_seq"] - 1
         else:
             snap_seq = 0
@@ -496,6 +512,9 @@ class Engine:
             if batch["seq"] <= snap_seq:
                 continue  # 快照已包含
             self._replay_batch(batch)
+            next_off = batch.get("next_offset")
+            if isinstance(next_off, int) and next_off >= 0:
+                self.resume_offset = next_off
         # 日志永远是权威：内存批次列表与日志保持完全一致
         self.batches = list(replayed_batches)
         if replayed_batches:

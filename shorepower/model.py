@@ -20,7 +20,9 @@ from typing import Any
 WINDOW_SECONDS = 15 * 60
 # 封账宽限：最慢网关水位超过窗口结束 10 分钟后封账
 SEAL_GRACE_SECONDS = 10 * 60
-SCHEMA_VERSION = 1
+# 状态 schema：2 起批次/快照携带 next_offset（下一条记录起始字节偏移），
+# 重启可直接定位续读位置；schema 1 的旧账照常加载（见 engine.restore）
+SCHEMA_VERSION = 2
 
 
 class RecordError(ValueError):
@@ -79,7 +81,8 @@ class Reading:
     berth: str
     meter_ts: int
     energy: float
-    offset: int = -1  # 由读取线程回填：源日志行偏移，不参与业务语义
+    offset: int = -1  # 由读取线程回填：源日志行起始字节偏移，不参与业务语义
+    end_offset: int = -1  # 行尾下一字节的偏移（= 下一行起点），续读定位用
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,7 @@ class Correction:
     meter_ts: int
     energy: float
     offset: int = -1
+    end_offset: int = -1
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,7 @@ class Progress:
     gateway: str
     progress_ts: int
     offset: int = -1
+    end_offset: int = -1
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,7 @@ class BadLine:
     raw: str
     reason: str
     offset: int = -1
+    end_offset: int = -1
 
 
 def _require_number(obj: dict, key: str) -> float:
@@ -123,17 +129,24 @@ def _require_str(obj: dict, key: str) -> str:
     return value
 
 
-def parse_line(raw_line: str, offset: int = -1) -> Reading | Correction | Progress | BadLine:
-    """解析一行日志。任何结构问题都转成 BadLine，绝不抛给调用方。"""
+def parse_line(raw_line: str, offset: int = -1,
+               end_offset: int = -1) -> Reading | Correction | Progress | BadLine:
+    """解析一行日志。任何结构问题都转成 BadLine，绝不抛给调用方。
+
+    ``offset``/``end_offset`` 均为源日志的原始字节偏移（空行、CRLF、非 ASCII
+    都按字节计），由读取线程按行原始字节长度算出后回填。
+    """
     line = raw_line.strip()
     if not line:
-        return BadLine(raw=raw_line, reason="空行", offset=offset)
+        return BadLine(raw=raw_line, reason="空行", offset=offset, end_offset=end_offset)
     try:
         obj = json.loads(line)
     except ValueError as exc:
-        return BadLine(raw=raw_line, reason=f"JSON 解析失败: {exc}", offset=offset)
+        return BadLine(raw=raw_line, reason=f"JSON 解析失败: {exc}",
+                       offset=offset, end_offset=end_offset)
     if not isinstance(obj, dict):
-        return BadLine(raw=raw_line, reason="日志行必须是 JSON 对象", offset=offset)
+        return BadLine(raw=raw_line, reason="日志行必须是 JSON 对象",
+                       offset=offset, end_offset=end_offset)
     kind = obj.get("type")
     try:
         if kind == "reading":
@@ -163,6 +176,6 @@ def parse_line(raw_line: str, offset: int = -1) -> Reading | Correction | Progre
         else:
             raise RecordError(f"未知 type: {kind!r}")
     except RecordError as exc:
-        return BadLine(raw=raw_line, reason=str(exc), offset=offset)
-    # 冻结 dataclass 的 offset 回填
-    return replace(rec, offset=offset)
+        return BadLine(raw=raw_line, reason=str(exc), offset=offset, end_offset=end_offset)
+    # 冻结 dataclass 的偏移回填
+    return replace(rec, offset=offset, end_offset=end_offset)
