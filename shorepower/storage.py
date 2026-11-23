@@ -63,6 +63,16 @@ def iter_jsonl(path: str) -> Iterator[dict]:
                 continue
 
 
+def load_persisted_batches(path: str) -> list[dict]:
+    """读取当前已持久化的全部批次（权威事实来源的一次性快照视图）。
+
+    崩溃恢复与离线 Parquet/JSONL 导出共用这一个读取口径：调用方拿到的列表在
+    返回后不再随日志追加而变化，因此“批次表”和由同一列表重放出的“窗口表”必然
+    对应同一个已 fsync 的批次边界。日志在读取期间被追加也不会混入本次结果。
+    """
+    return list(iter_jsonl(path))
+
+
 class SnapshotStore:
     """原子快照写入与读取。快照永远只反映已经 fsync 进批次日志的状态。"""
 

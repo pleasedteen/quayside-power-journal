@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -24,7 +25,18 @@ sys.path.insert(0, str(ROOT))  # -I 模式下不会自动带脚本目录，这�
 
 from shorepower.feeder import replay  # noqa: E402
 from shorepower.generator import write_log  # noqa: E402
-from shorepower.storage import dumps_canonical  # noqa: E402
+from shorepower.storage import (  # noqa: E402
+    BATCHES_NAME,
+    SnapshotStore,
+    dumps_canonical,
+    load_persisted_batches,
+)
+from shorepower.engine import Engine  # noqa: E402
+from shorepower.export_parquet import (  # noqa: E402
+    export,
+    read_export,
+    read_table_rows,
+)
 
 PASS, FAIL = "✅ 通过", "❌ 失败"
 
@@ -119,6 +131,93 @@ def assert_equal(label: str, a, b) -> None:
     if dumps_canonical(a) != dumps_canonical(b):
         raise AssertionError(f"{label} 不一致\n--- A ---\n{dumps_canonical(a)}\n--- B ---\n{dumps_canonical(b)}")
     print(f"  {PASS} {label}")
+
+
+# ------------------------------------------------- 场景 5 辅助：导出边界核对与故障注入
+
+
+def verify_export_pair(state_dir: Path, out_prefix: Path, expect_seq: int | None = None) -> dict:
+    """读回最近一次导出，核对两张表同属一个已持久化批次边界且内容可独立对账。"""
+    info = read_export(str(out_prefix))
+    as_of = info["as_of_seq"]
+    assert isinstance(as_of, int) and as_of >= 0, f"manifest 缺少可核对边界: {info}"
+    if expect_seq is not None:
+        assert as_of == expect_seq, f"导出边界 {as_of} != 期望 {expect_seq}"
+
+    batch_rows = read_table_rows(info["batches_path"])
+    window_rows = read_table_rows(info["windows_path"])
+    assert batch_rows and window_rows or as_of == 0
+    assert all(r["as_of_seq"] == as_of for r in batch_rows), "批次表存在越界/混批行"
+    assert all(r["as_of_seq"] == as_of for r in window_rows), "窗口表存在越界/混批行"
+    assert len(batch_rows) == info["batch_rows"] and len(window_rows) == info["window_rows"]
+
+    # 与状态目录里截至该边界的已持久化批次独立对账（嵌套字段在表中是 JSON 字符串）
+    persisted = load_persisted_batches(str(state_dir / BATCHES_NAME))
+    pinned = persisted[:as_of]
+    assert [r["seq"] for r in batch_rows] == [b["seq"] for b in pinned]
+    for row, batch in zip(batch_rows, pinned):
+        for key, value in batch.items():
+            if isinstance(value, (dict, list)):
+                assert json.loads(row[key]) == value
+            else:
+                assert row[key] == value
+
+    # 窗口表必须等于“同一批批次”经引擎重放（与崩溃恢复同一路径）的结果
+    from shorepower.export_parquet import build_window_rows
+    expect_windows = build_window_rows(Engine.from_persisted_batches(pinned), as_of)
+    assert window_rows == expect_windows, "窗口表与同边界批次重放结果不一致"
+    return info
+
+
+class _BackgroundAppender:
+    """后台持续向源日志追加模拟行，驱动服务并发入账（导出期间新批次不断落盘）。"""
+
+    def __init__(self, source: Path, target: Path, interval: float = 0.02):
+        self.source = source
+        self.target = target
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        i = 0
+        while not self._stop.is_set():
+            with open(self.target, "a", encoding="utf-8") as fh:
+                fh.write(self._lines[i % len(self._lines)])
+                fh.flush()
+                os.fsync(fh.fileno())
+            i += 1
+            self._stop.wait(self.interval)
+
+
+def start_stalled_export(state_dir: Path, out_prefix: Path, fmt: str,
+                         stall_seconds: float = 5.0) -> subprocess.Popen:
+    env = dict(os.environ)
+    env["SHOREPOWER_EXPORT_STALL_BEFORE_COMMIT"] = str(stall_seconds)
+    return subprocess.Popen(
+        [sys.executable, "-I", str(ROOT / "selftest_support" / "export_kill_driver.py"),
+         "--state-dir", str(state_dir), "--out-prefix", str(out_prefix),
+         "--format", fmt],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+    )
+
+
+def wait_version_dirs(export_root: Path, minimum: int, timeout: float = 10.0) -> list[str]:
+    def scan():
+        if not export_root.is_dir():
+            return None
+        dirs = sorted(n for n in os.listdir(export_root)
+                      if n.startswith("v") and n[1:].isdigit())
+        return dirs if len(dirs) >= minimum else None
+    return wait_until(scan, timeout=timeout)
 
 
 def main() -> int:
@@ -267,6 +366,155 @@ def main() -> int:
             p2 = http_get(18095, f"/batches?after_seq={p1['batches'][-1]['seq']}&limit=5")
             assert_equal("批次分页序号衔接",
                          p2["batches"][0]["seq"], p1["batches"][-1]["seq"] + 1)
+        finally:
+            stop_service(proc)
+
+        # ------------------------------------------------ 场景 5：导出统一批次边界（并发入账 + 强杀）
+        print("[场景 5] 导出读取口径统一到已持久化批次边界：并发入账不混批，强杀后旧版两表成对可读")
+        # pyarrow 不在环境里时自动走纯标准库 jsonl；装了 pyarrow 则两种格式各验一遍
+        try:
+            import pyarrow  # noqa: F401
+            export_formats = ["jsonl", "parquet"]
+            print("    检测到 pyarrow，jsonl 与 parquet 两种格式均参与自测")
+        except ImportError:
+            export_formats = ["jsonl"]
+            print("    未安装 pyarrow，使用纯标准库 jsonl 格式覆盖同一套导出语义")
+
+        exp_state = work / "export_state"
+        exp_log = work / "export.log"
+        exp_state.mkdir()
+        proc = start_service(exp_state, exp_log, 18096)
+        try:
+            replay(str(work / "mock.jsonl"), str(exp_log), delay=0.0)
+            wait_until(
+                lambda: read_jsonl(exp_state / "batches.jsonl")
+                if len(read_jsonl(exp_state / "batches.jsonl")) == len(fast["batches"]) else None,
+                timeout=20,
+            )
+            # 先产出一版“上一版导出”，作为强杀后必须保持可读的成对基线
+            prefix0 = work / "report_base"
+            first = export(str(exp_state), str(prefix0), fmt=export_formats[0])
+            verify_export_pair(exp_state, prefix0)
+            base_seq = first["as_of_seq"]
+            print(f"    基线导出版本 v{first['version_seq']:06d}，边界 as_of_seq={base_seq}")
+
+            # 后台持续入账：导出全程都有新批次落盘，验证窗口表不会混入当次边界之外的数据
+            appender = _BackgroundAppender(work / "mock.jsonl", exp_log)
+            appender.start()
+            try:
+                # 等后台入账确实推进了持久化批次，再开始导出，保证导出与入账真实并发
+                wait_until(
+                    lambda: max((b["seq"] for b in read_jsonl(exp_state / "batches.jsonl")),
+                                default=0) > base_seq or None,
+                    timeout=15,
+                )
+                prior_seq = base_seq
+                for round_idx, fmt in enumerate(export_formats, start=1):
+                    prefix = work / f"report_{fmt}"
+                    info = export(str(exp_state), str(prefix), fmt=fmt)
+                    # 后台在追加，持久化批次理应推进；导出边界必须是导出瞬间已落盘的真实批次号
+                    current_last = max(
+                        (b["seq"] for b in read_jsonl(exp_state / "batches.jsonl")),
+                        default=0,
+                    )
+                    assert prior_seq < info["as_of_seq"] <= current_last, (
+                        f"导出边界 {info['as_of_seq']} 越界或未推进，持久化末批={current_last}")
+                    verify_export_pair(exp_state, prefix, expect_seq=info["as_of_seq"])
+                    prior_seq = info["as_of_seq"]
+                    print(f"    {fmt} 并发导出第 {round_idx} 轮：边界 as_of_seq={info['as_of_seq']}，"
+                          f"批次表 {info['batch_rows']} 行 / 窗口表 {info['window_rows']} 行，"
+                          f"并发新批次未混入当次窗口表")
+                    # 再等一轮入账推进，让下一次导出面对更新的批次边界
+                    wait_until(
+                        lambda: max((b["seq"] for b in read_jsonl(exp_state / "batches.jsonl")),
+                                    default=0) > prior_seq or None,
+                        timeout=15,
+                    )
+
+                # ---- 确定性强杀：两表已 fsync、latest 切换前 SIGKILL
+                kill_prefix = work / "report_kill"
+                killed = start_stalled_export(exp_state, kill_prefix, export_formats[0])
+                try:
+                    orphan_dirs = wait_version_dirs(
+                        kill_prefix.parent / f"{kill_prefix.name}.export", minimum=1)
+                    time.sleep(0.3)  # 确保进入提交前停顿窗口
+                    killed.send_signal(signal.SIGKILL)
+                    killed.wait(timeout=10)
+                finally:
+                    if killed.poll() is None:
+                        killed.send_signal(signal.SIGKILL)
+                        killed.wait(timeout=10)
+                print(f"    已在提交前 SIGKILL 导出进程，孤儿版本目录: {orphan_dirs}")
+
+                # 强杀发生在 latest 切换之前：不存在成功指针，旧的成对表不受影响
+                kill_root = kill_prefix.parent / f"{kill_prefix.name}.export"
+                assert not (kill_root / "latest").exists(), "强杀后不应出现 latest 指针"
+                leftover = sorted(n for n in os.listdir(kill_root)
+                                  if n.startswith("v") and n[1:].isdigit())
+                assert leftover, "强杀应留下未提交的不可变版本目录"
+                base_info = read_export(str(prefix0))
+                assert base_info["as_of_seq"] == base_seq, "上一版导出的边界被强杀破坏"
+                base_batch_rows = read_table_rows(base_info["batches_path"])
+                base_window_rows = read_table_rows(base_info["windows_path"])
+                assert all(r["as_of_seq"] == base_seq for r in base_batch_rows)
+                assert all(r["as_of_seq"] == base_seq for r in base_window_rows)
+                assert_equal("强杀后上一版两张表仍可成对读取且边界不变",
+                             base_info["as_of_seq"], base_seq)
+
+                # 同前缀重新导出：原子提交成功，新版本与被杀死的孤儿目录并存、可逐版读取
+                recovered = export(str(exp_state), str(kill_prefix), fmt=export_formats[0])
+                rec_info = verify_export_pair(exp_state, kill_prefix)
+                assert rec_info["as_of_seq"] >= base_seq
+                all_versions = sorted(n for n in os.listdir(kill_root)
+                                      if n.startswith("v") and n[1:].isdigit())
+                assert len(all_versions) == len(leftover) + 1, "新版本不得覆盖孤儿目录"
+                print(f"    强杀后重新导出成功：latest=v{rec_info['version_seq']:06d}，"
+                      f"保留版本 {all_versions}")
+
+                # ---- 再做几轮随机时刻 SIGKILL，覆盖写入途中/提交前后的任意时点
+                random_killed_ok = 0
+                for trial in range(6):
+                    trial_prefix = work / f"report_rand_{trial}"
+                    p = subprocess.Popen(
+                        [sys.executable, "-I",
+                         str(ROOT / "run_export_parquet.py"),
+                         "--state-dir", str(exp_state),
+                         "--out-prefix", str(trial_prefix),
+                         "--format", export_formats[0]],
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+                    time.sleep(0.005 * (trial + 1))  # 落在导出的不同阶段
+                    p.send_signal(signal.SIGKILL)
+                    p.wait(timeout=10)
+                    # 无论杀死在哪一步：已提交的导出都必须成对可读，未提交的不出现 latest
+                    rroot = trial_prefix.parent / f"{trial_prefix.name}.export"
+                    if (rroot / "latest").exists():
+                        verify_export_pair(exp_state, trial_prefix)
+                        random_killed_ok += 1
+                    else:
+                        assert not (rroot / "latest").exists()
+                        random_killed_ok += 1
+                assert_equal("6 轮任意时点 SIGKILL 后导出目录始终无撕裂（成对可读或未提交）",
+                             random_killed_ok, 6)
+            finally:
+                appender.stop()
+
+            # ---- 恢复与导出读取口径一致性：删掉快照只靠批次日志，结果必须相同
+            snap_path = exp_state / "snapshot.json"
+            had_snapshot = snap_path.exists()
+            if had_snapshot:
+                snap_path.unlink()
+            journal_only = Engine.from_persisted_batches(
+                load_persisted_batches(str(exp_state / BATCHES_NAME)))
+            restored = Engine(snapshot_store=SnapshotStore(str(exp_state)))
+            assert_equal("无快照恢复与快照恢复的批次视图一致",
+                         journal_only.batches, restored.batches)
+            assert_equal("无快照恢复与快照恢复的窗口视图一致",
+                         journal_only.windows, restored.windows)
+            prefix_nosnap = work / "report_nosnap"
+            export(str(exp_state), str(prefix_nosnap), fmt=export_formats[0])
+            verify_export_pair(exp_state, prefix_nosnap)
+            print("    恢复（快照/纯批次日志）与导出共用同一已持久化批次读取口径，结果一致")
         finally:
             stop_service(proc)
 

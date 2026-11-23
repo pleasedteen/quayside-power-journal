@@ -21,7 +21,7 @@ from .model import (
     seal_watermark_progress,
     window_start,
 )
-from .storage import SnapshotStore
+from .storage import BATCHES_NAME, SnapshotStore, load_persisted_batches
 
 
 def _new_window() -> dict:
@@ -44,6 +44,27 @@ class Engine:
         self.min_meter_ts: int | None = None
         self._since_snapshot = 0
         self.restore()
+
+    @classmethod
+    def from_persisted_batches(cls, batches: list[dict]) -> "Engine":
+        """只按给定的已持久化批次列表重建内存视图，不依赖快照、也不重读日志。
+
+        离线导出用它保证“窗口表”与“批次表”来自同一个批次边界：``batches`` 通常由
+        :func:`shorepower.storage.load_persisted_batches` 一次性读出，读取期间日志
+        继续追加的新批次不会进入这里。
+        """
+        engine = cls.__new__(cls)
+        engine.lock = threading.RLock()
+        engine.snapshot_store = None
+        engine.gateways = set()
+        engine.progress = {}
+        engine.readings = {}
+        engine.windows = {}
+        engine.committed_offset = -1
+        engine.min_meter_ts = None
+        engine._since_snapshot = 0
+        engine._apply_batches(batches)
+        return engine
 
     # ------------------------------------------------------------- 批次工具
     def _next_seq(self) -> int:
@@ -457,19 +478,39 @@ class Engine:
             self.snapshot_store.write(payload)
             self._since_snapshot = 0
 
+    def _apply_batches(self, batches: list[dict], replay_only: bool = False) -> None:
+        """把一组已持久化批次按序应用到内存（恢复与导出共用同一条重放路径）。
+
+        ``replay_only=True``：只重放账务效果，不重置批次列表/提交偏移（快照恢复路径，
+        快照之前的批次已在内存里）。``False``：纯批次重建，批次列表与派生统计同时
+        对齐到这组批次（离线导出/无快照恢复路径）。
+        """
+        with self.lock:
+            for batch in batches:
+                self._replay_batch(batch)
+            if replay_only:
+                return
+            self.batches = list(batches)
+            if batches:
+                self.committed_offset = max(
+                    b.get("source_offset", b.get("trigger_offset", -1))
+                    for b in batches
+                )
+            if self.readings:
+                self.min_meter_ts = min(r["meter_ts"] for r in self.readings.values())
+
     def restore(self) -> None:
         """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。"""
         store = self.snapshot_store
         if store is None:
             return
         snap = store.read()
-        # 批次日志与快照同目录
-        from .storage import BATCHES_NAME, iter_jsonl
+        # 批次日志与快照同目录；与离线导出共用同一个已持久化批次读取口径
         import os
 
         jpath = os.path.join(store.directory, BATCHES_NAME)
-        replayed_batches = list(iter_jsonl(jpath)) if os.path.exists(jpath) else []
-        if snap is None and not replayed_batches:
+        persisted = load_persisted_batches(jpath)
+        if snap is None and not persisted:
             return
 
         if snap is not None:
@@ -492,18 +533,16 @@ class Engine:
         else:
             snap_seq = 0
 
-        for batch in replayed_batches:
-            if batch["seq"] <= snap_seq:
-                continue  # 快照已包含
-            self._replay_batch(batch)
+        fresh = [batch for batch in persisted if batch["seq"] > snap_seq]
+        self._apply_batches(fresh, replay_only=True)
         # 日志永远是权威：内存批次列表与日志保持完全一致
-        self.batches = list(replayed_batches)
-        if replayed_batches:
+        self.batches = list(persisted)
+        if persisted:
             self.committed_offset = max(
                 self.committed_offset,
                 max(
                     b.get("source_offset", b.get("trigger_offset", -1))
-                    for b in replayed_batches
+                    for b in persisted
                 ),
             )
         # readings 是权威的当前生效版本集合，水位扫描起点直接由其重算

@@ -16,7 +16,7 @@ SIGKILL 后同目录重启的精确一次恢复。仅用 Python 3.11 标准库�
 | `shorepower/generator.py` | 确定性本地模拟日志生成器 |
 | `shorepower/feeder.py` | 按可配置速度把日志逐行追加到跟读目标 |
 | `shorepower/cli.py` | 本地查询客户端 |
-| `shorepower/export_parquet.py` | 可选：导出 Parquet（需 `pip install pyarrow`） |
+| `shorepower/export_parquet.py` | 可选：导出 Parquet（需 `pip install pyarrow`）；同口径 JSONL 导出纯标准库可用 |
 | `run_*.py` | 各能力的入口脚本，均支持 `python -I` 隔离模式 |
 | `selftest.py` | 端到端自测，80 秒内输出可读结果 |
 
@@ -114,14 +114,43 @@ python3 -I selftest.py
 
 覆盖：瞬时 vs 慢速回放的批次/顺序/窗口状态逐字节一致、四个窗口封账电量、
 版本驳回与整笔事务、同更正同批可见、SIGKILL 崩溃恢复精确一次、多窗口查询与批次分页、
-背压约束。实测约 5 秒完成，输出逐项 ✅/❌ 可读结论。
+背压约束、导出统一批次边界（并发入账不混批 + 导出进程任意时点 SIGKILL 后旧版两表成对可读）。
+实测约 6 秒完成，输出逐项 ✅/❌ 可读结论。无 pyarrow 环境自动以 JSONL 格式覆盖导出语义，
+检测到 pyarrow 时 jsonl/parquet 两种格式都会验证。
 
-## 8. 可选 Parquet 导出
+## 8. 可选 Parquet 导出（统一批次边界、成对原子提交）
 
 ```bash
 pip install pyarrow
 python3 -I run_export_parquet.py --state-dir ./data/state --out-prefix ./data/report
-# 生成 report.batches.parquet 与 report.windows.parquet
+# 未安装 pyarrow 时可改用纯标准库的同口径 JSONL 导出：
+python3 -I run_export_parquet.py --state-dir ./data/state --out-prefix ./data/report --format jsonl
 ```
 
 未安装 pyarrow 时主服务不受影响，JSON Lines 始终可用且信息等价。
+
+### 8.1 统一读取口径
+
+持续入账时服务会不断向 `batches.jsonl` 追加新批次。每次导出开始时先**一次性**读出
+当前已 fsync 的批次列表并固定为本次导出的批次边界：
+
+- 边界批次号写入 manifest 与两张表每一行的 `as_of_seq` 列（旧列保持不变，仅末尾追加）；
+- 批次表只写这组批次；窗口表只由这组批次经引擎重放得到，与崩溃恢复走同一条重放路径
+  （`Engine.from_persisted_batches`），因此两张表必然对应同一个已持久化批次号；
+- 导出期间新批次继续落盘，但不会混入当次导出的窗口表，只会出现在下一次导出里。
+
+### 8.2 目录布局与强杀语义
+
+```
+<out-prefix>.export/
+  v000001/  batches.{parquet,jsonl}  windows.{parquet,jsonl}  export-manifest.json
+  v000002/  ...                       ...                       ...
+  latest -> v000002/                  # 原子符号链接（不支持符号链接时退化为指针文件）
+<out-prefix>.batches.{parquet,jsonl} # 兼容旧调用方的固定名入口，指向 latest
+<out-prefix>.windows.{parquet,jsonl}
+```
+
+每个版本目录不可变、旧版本全部保留；`latest` 只做一次原子切换，两张表同时生效。
+导出进程中途被 SIGKILL 时：尚未提交的版本留在目录里但没有 `latest` 指向，上一版的
+两张表仍可成对读取，绝不会出现一张新表配一张旧表。`read_export()` 可按前缀读回
+最近一次成功导出的 manifest 与成对表路径；旧版固定名普通文件布局仍被识别。
