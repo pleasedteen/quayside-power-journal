@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any, Iterator
 
 SNAPSHOT_TMP = "snapshot.json.tmp"
@@ -73,6 +74,12 @@ class SnapshotStore:
 
     def write(self, payload: dict) -> None:
         os.makedirs(self.directory, exist_ok=True)
+        # 历史失败可能残留临时文件，先清理，避免被前一次的半截文件干扰
+        try:
+            if os.path.exists(self.tmp_path):
+                os.remove(self.tmp_path)
+        except OSError:
+            pass
         with open(self.tmp_path, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=1))
             fh.flush()
@@ -82,8 +89,163 @@ class SnapshotStore:
     def read(self) -> dict | None:
         if not os.path.exists(self.path):
             return None
-        with open(self.path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+        # 快照只是加速恢复的副本，批次日志才是权威事实来源：
+        # 快照损坏 / 被非法类型占位（如同名目录）/ JSON 非法时退回「无快照」，
+        # 由调用方纯靠批次日志重放，绝不能因为快照问题导致服务起不来。
+        try:
+            if not os.path.isfile(self.path):
+                return None
+            with open(self.path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+
+class SnapshotManager:
+    """后台快照写线程：把快照写盘与账务线程解耦。
+
+    语义保证：
+
+    * 快照写盘变慢或失败时，``request`` 不阻塞账务线程，服务继续入账；
+      已 fsync 的批次与账态通过查询接口照常可见。
+    * 负载严格有界：至多 1 个 payload 正在写 + 1 个 payload 待写。
+      待写位被占用时新请求被拒收（返回 ``False``），账务线程处理下一条记录
+      时会携带最新状态重试，因此内存不会随积压记录数增长。
+    * 暂停（``set_paused(True)``）期间一律拒收，调用方因此不会构建 payload，
+      快照子系统不引入与业务量相关的额外内存。
+    * 写入只在临时文件上进行，成功后才 ``os.replace`` 原子替换；写失败时
+      旧版完整快照原样保留，仍可用于恢复。
+    """
+
+    def __init__(self, store: SnapshotStore):
+        self.store = store
+        self._cond = threading.Condition(threading.Lock())
+        self._pending: dict | None = None
+        self._busy = False
+        self._paused = False
+        self._closing = False
+        self._last_error: str | None = None
+        self.successes = 0
+        self.failures = 0
+        self.skipped_paused = 0
+        self.skipped_busy = 0
+        self._thread = threading.Thread(
+            target=self._run, name="snapshot-writer", daemon=True
+        )
+        self._thread.start()
+
+    # --------------------------------------------------------- 账务线程侧
+    @property
+    def paused(self) -> bool:
+        with self._cond:
+            return self._paused
+
+    def set_paused(self, paused: bool) -> None:
+        with self._cond:
+            self._paused = paused
+            self._cond.notify_all()
+
+    def note_skip(self) -> None:
+        """登记一次因暂停而未投递的快照尝试（在构建大 payload 之前调用）。
+
+        账务线程用它避免暂停时白白深拷贝整份账态；暂停计数与
+        :meth:`request` 在暂停下的拒收口径一致，状态接口可观察。
+        """
+        with self._cond:
+            if self._closing or not self._paused:
+                return
+            self.skipped_paused += 1
+
+    def request(self, payload: dict) -> bool:
+        """非阻塞投递一个快照 payload。
+
+        返回 True 表示已被后台线程接收；False 表示因暂停/关闭/待写位占用
+        而拒收并累计对应计数。拒收后调用方无需重试，后续记录触发时会携带
+        最新状态再来——这保证快照相关内存严格有界，不随业务积压增长。
+        """
+        with self._cond:
+            if self._closing:
+                return False
+            if self._paused:
+                self.skipped_paused += 1
+                return False
+            if self._pending is not None:
+                self.skipped_busy += 1
+                return False
+            self._pending = payload
+            self._cond.notify_all()
+            return True
+
+    def status(self) -> dict:
+        with self._cond:
+            return {
+                "paused": self._paused,
+                "inflight": 1 if self._busy else 0,
+                "queued": 1 if self._pending is not None else 0,
+                "max_pending_payloads": 1,
+                "successes": self.successes,
+                "failures": self.failures,
+                "skipped_paused": self.skipped_paused,
+                "skipped_busy": self.skipped_busy,
+                "last_error": self._last_error,
+                "snapshot_path": self.store.path,
+            }
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        """等待当前快照写盘完成（测试/优雅停机用）。"""
+        import time
+
+        with self._cond:
+            end = time.monotonic() + timeout
+            while (self._busy or self._pending is not None) and not self._closing:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return not self._busy and self._pending is None
+
+    def close(self, flush: bool = True) -> None:
+        """停止后台线程；flush=True 时先把待写 payload 落盘。"""
+        with self._cond:
+            if self._closing:
+                self._thread.join(timeout=5.0)
+                return
+            if not flush:
+                self._pending = None
+            self._closing = True
+            self._cond.notify_all()
+        self._thread.join(timeout=10.0)
+
+    # --------------------------------------------------------- 后台写线程
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None and not self._closing:
+                    self._cond.wait()
+                if self._pending is None and self._closing:
+                    return
+                payload = self._pending
+                self._pending = None
+                self._busy = True
+            try:
+                self.store.write(payload)
+                with self._cond:
+                    self.successes += 1
+                    self._last_error = None
+            except Exception as exc:  # noqa: BLE001 - 写盘失败只留痕，绝不能带崩服务
+                with self._cond:
+                    self.failures += 1
+                    self._last_error = f"{type(exc).__name__}: {exc}"
+                # 清理可能残留的临时文件；正式快照（旧版完整快照）保持不动
+                try:
+                    if os.path.exists(self.store.tmp_path):
+                        os.remove(self.store.tmp_path)
+                except OSError:
+                    pass
+            finally:
+                with self._cond:
+                    self._busy = False
+                    self._cond.notify_all()
 
 
 class TailReader:

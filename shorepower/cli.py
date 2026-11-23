@@ -62,6 +62,19 @@ def _print_batches(payload: dict) -> None:
             print(f"           新水位: {b['new_progress']}")
 
 
+def _post(base: str, path: str) -> dict:
+    url = base.rstrip("/") + path
+    req = urllib.request.Request(url, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"无法连接服务 {url}: {exc.reason}") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="shorepower-query", description="岸电账务服务本地查询客户端")
     p.add_argument("--base-url", default="http://127.0.0.1:8080")
@@ -75,14 +88,39 @@ def main(argv: list[str] | None = None) -> int:
     pb.add_argument("--limit", type=int, default=None)
     pb.add_argument("--raw", action="store_true", help="直接输出原始 JSON")
 
-    sub.add_parser("stats", help="运行统计（含背压队列长度、已提交偏移）")
+    sub.add_parser("stats", help="运行统计（含背压队列长度、已提交偏移、快照状态）")
     sub.add_parser("health", help="健康检查")
+
+    ps = sub.add_parser("snapshot-status", help="查看后台快照写盘状态（暂停/成功/失败计数）")
+    ps.add_argument("--raw", action="store_true", help="直接输出原始 JSON")
+    sub.add_parser("snapshot-pause", help="暂停快照写盘（入账与查询不受影响）")
+    sub.add_parser("snapshot-resume", help="恢复快照写盘")
 
     args = p.parse_args(argv)
     if args.cmd == "health":
         print(json.dumps(_get(args.base_url, "/health"), ensure_ascii=False))
     elif args.cmd == "stats":
         print(json.dumps(_get(args.base_url, "/stats"), ensure_ascii=False, indent=2))
+    elif args.cmd == "snapshot-status":
+        payload = _get(args.base_url, "/snapshot/status")
+        if args.raw:
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        elif not payload.get("enabled", False):
+            print("快照后台写盘未启用（--snapshot-every 0）")
+        else:
+            print(f"暂停: {payload['paused']}  在写: {payload['inflight']}  "
+                  f"待写: {payload['queued']}（上限 {payload['max_pending_payloads']}）")
+            print(f"成功 {payload['successes']} 次，失败 {payload['failures']} 次；"
+                  f"暂停跳过 {payload['skipped_paused']}，积压跳过 {payload['skipped_busy']}")
+            if payload["last_error"]:
+                print(f"最近错误: {payload['last_error']}")
+            print(f"快照路径: {payload['snapshot_path']}")
+    elif args.cmd == "snapshot-pause":
+        print(json.dumps(_post(args.base_url, "/snapshot/pause"),
+                         ensure_ascii=False, indent=2, sort_keys=True))
+    elif args.cmd == "snapshot-resume":
+        print(json.dumps(_post(args.base_url, "/snapshot/resume"),
+                         ensure_ascii=False, indent=2, sort_keys=True))
     elif args.cmd == "windows":
         params = [("window", w) for w in args.window]
         payload = _get(args.base_url, "/windows", params or None)

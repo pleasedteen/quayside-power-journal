@@ -30,9 +30,13 @@ def _new_window() -> dict:
 
 
 class Engine:
-    def __init__(self, snapshot_store: SnapshotStore | None = None):
+    def __init__(self, snapshot_store: SnapshotStore | None = None,
+                 snapshot_manager=None):
         self.lock = threading.RLock()
         self.snapshot_store = snapshot_store
+        # 后台快照写管理器（可选）：注入后快照写盘与账务线程解耦，
+        # 写盘慢/失败/暂停都不阻塞入账；为 None 时退化为同步写（兼容离线用途）。
+        self.snapshot_manager = snapshot_manager
         self.gateways: set[str] = set()
         self.progress: dict[str, int] = {}
         # reading_id -> 当前生效版本 {gateway, berth, meter_ts, energy, version, offset}
@@ -415,7 +419,7 @@ class Engine:
     def stats(self, inflight: int = 0) -> dict:
         with self.lock:
             sealed = sum(1 for w in self.windows.values() if w["sealed"])
-            return {
+            result = {
                 "published_batches": len(self.batches),
                 "last_seq": self.batches[-1]["seq"] if self.batches else 0,
                 "committed_source_offset": self.committed_offset,
@@ -426,27 +430,74 @@ class Engine:
                 "windows_total": len(self.windows),
                 "windows_sealed": sealed,
             }
+            if self.snapshot_manager is not None:
+                result["snapshot"] = self.snapshot_manager.status()
+            return result
 
     # ----------------------------------------------------- 快照与崩溃恢复
     def maybe_snapshot(self, interval: int) -> None:
+        """达到 interval 条记录的节奏点时尝试快照；interval<=0 关闭。
+
+        后台管理器模式下：暂停或写盘积压时直接跳过，不构建 payload，
+        由下一条记录携带最新状态重试，因此本调用永远不阻塞账务线程。
+        """
         if interval <= 0 or self._since_snapshot < interval:
             return
-        self.take_snapshot()
+        self.trigger_snapshot()
 
-    def take_snapshot(self) -> None:
+    def take_snapshot(self) -> bool:
+        """立即触发一次快照，返回是否被接收/写成功（暂停或写失败时为 False）。"""
         if self.snapshot_store is None:
-            return
+            return False
+        return self._trigger_snapshot()
+
+    def trigger_snapshot(self) -> bool:
+        """按当前快照节奏触发：后台模式非阻塞投递，无管理器时同步写。"""
+        if self.snapshot_store is None:
+            return False
+        return self._trigger_snapshot()
+
+    def _trigger_snapshot(self) -> bool:
+        manager = self.snapshot_manager
+        if manager is not None:
+            # 快速通道：暂停时连 payload 都不构建，内存与业务量解耦；
+            # 跳过计数由管理器统一登记，状态接口可观察。
+            if manager.paused:
+                manager.note_skip()
+                return False
+        payload = self._build_snapshot_payload()
+        if manager is None:
+            # 同步路径（快照后台关闭时的离线/停机用途）：写失败也绝不能影响
+            # 账务与服务生命周期，批次日志才是权威事实来源，下次启动可重放恢复。
+            try:
+                self.snapshot_store.write(payload)
+            except OSError:
+                return False
+            self._since_snapshot = 0
+            return True
+        # 积压（1 在写 + 1 待写）时 request 拒收并计 skipped_busy，下条记录重试
+        accepted = manager.request(payload)
+        if accepted:
+            self._since_snapshot = 0
+        return accepted
+
+    def _build_snapshot_payload(self) -> dict:
+        """在账务锁内构建与当前内存状态完全脱离引用的深拷贝 payload。
+
+        调用方（账务线程）此前已把对应批次 fsync 进批次日志，因此快照
+        永远只反映已完整落盘的输入对应的账态，不会领先权威日志。
+        """
         with self.lock:
-            payload = {
+            return {
                 "schema": SCHEMA_VERSION,
                 "gateways": sorted(self.gateways),
-                "progress": self.progress,
-                "readings": self.readings,
+                "progress": dict(self.progress),
+                "readings": {k: dict(v) for k, v in self.readings.items()},
                 "windows": {
                     str(k): {
                         "sealed": v["sealed"],
-                        "totals": v["totals"],
-                        "contributions": v["contributions"],
+                        "totals": dict(v["totals"]),
+                        "contributions": {rid: dict(c) for rid, c in v["contributions"].items()},
                     }
                     for k, v in self.windows.items()
                 },
@@ -454,11 +505,23 @@ class Engine:
                 "committed_offset": self.committed_offset,
                 "min_meter_ts": self.min_meter_ts,
             }
-            self.snapshot_store.write(payload)
-            self._since_snapshot = 0
+
+    def snapshot_status(self) -> dict | None:
+        """后台快照管理器的运行状态；未启用管理器时返回 None。"""
+        if self.snapshot_manager is None:
+            return None
+        return self.snapshot_manager.status()
+
+    def set_snapshot_paused(self, paused: bool) -> None:
+        if self.snapshot_manager is not None:
+            self.snapshot_manager.set_paused(paused)
 
     def restore(self) -> None:
-        """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。"""
+        """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。
+
+        快照仅是加速恢复的副本：任何不可用（缺失/损坏/schema 不符/字段异常）
+        都静默退化为纯批次日志重放，批次日志作为权威事实来源始终可独立恢复。
+        """
         store = self.snapshot_store
         if store is None:
             return
@@ -472,25 +535,34 @@ class Engine:
         if snap is None and not replayed_batches:
             return
 
+        snap_seq = 0
         if snap is not None:
-            if snap.get("schema") != SCHEMA_VERSION:
-                raise ValueError(f"不支持的快照 schema: {snap.get('schema')!r}")
-            self.gateways = set(snap["gateways"])
-            self.progress = dict(snap["progress"])
-            self.readings = {k: dict(v) for k, v in snap["readings"].items()}
-            self.windows = {
-                int(k): {
-                    "sealed": v["sealed"],
-                    "totals": dict(v["totals"]),
-                    "contributions": {rid: dict(c) for rid, c in v["contributions"].items()},
+            try:
+                if snap.get("schema") != SCHEMA_VERSION:
+                    raise ValueError(f"不支持的快照 schema: {snap.get('schema')!r}")
+                self.gateways = set(snap["gateways"])
+                self.progress = dict(snap["progress"])
+                self.readings = {k: dict(v) for k, v in snap["readings"].items()}
+                self.windows = {
+                    int(k): {
+                        "sealed": v["sealed"],
+                        "totals": dict(v["totals"]),
+                        "contributions": {rid: dict(c) for rid, c in v["contributions"].items()},
+                    }
+                    for k, v in snap["windows"].items()
                 }
-                for k, v in snap["windows"].items()
-            }
-            self.committed_offset = snap["committed_offset"]
-            self.min_meter_ts = snap.get("min_meter_ts")
-            snap_seq = snap["next_seq"] - 1
-        else:
-            snap_seq = 0
+                self.committed_offset = snap["committed_offset"]
+                self.min_meter_ts = snap.get("min_meter_ts")
+                snap_seq = snap["next_seq"] - 1
+            except (KeyError, TypeError, ValueError):
+                # 快照内容异常：清空半加载状态，完全交由批次日志重建
+                self.gateways = set()
+                self.progress = {}
+                self.readings = {}
+                self.windows = {}
+                self.committed_offset = -1
+                self.min_meter_ts = None
+                snap_seq = 0
 
         for batch in replayed_batches:
             if batch["seq"] <= snap_seq:

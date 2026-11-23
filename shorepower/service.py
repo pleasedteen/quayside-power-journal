@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import queue
 import signal
 import threading
@@ -16,7 +15,14 @@ from urllib.parse import parse_qs, urlparse
 
 from .engine import Engine
 from .model import parse_line
-from .storage import BATCHES_NAME, JournalWriter, SnapshotStore, TailReader, dumps_canonical
+from .storage import (
+    BATCHES_NAME,
+    JournalWriter,
+    SnapshotManager,
+    SnapshotStore,
+    TailReader,
+    dumps_canonical,
+)
 
 
 class _Reader(threading.Thread):
@@ -74,9 +80,34 @@ def _make_handler(engine: Engine, get_inflight: object):
                     self._send(200, engine.query_batches(after, limit))
                 elif url.path == "/stats":
                     self._send(200, engine.stats(inflight=get_inflight()))
+                elif url.path == "/snapshot/status":
+                    status = engine.snapshot_status()
+                    if status is None:
+                        self._send(200, {"enabled": False})
+                    else:
+                        self._send(200, {"enabled": True, **status})
                 else:
                     self._send(404, {"error": "未知路径", "paths": [
-                        "/health", "/windows?window=...", "/batches?after_seq=..&limit=..", "/stats"]})
+                        "/health", "/windows?window=...", "/batches?after_seq=..&limit=..",
+                        "/stats", "/snapshot/status",
+                        "POST /snapshot/pause", "POST /snapshot/resume"]})
+            except (ValueError, KeyError) as exc:
+                self._send(400, {"error": f"请求参数非法: {exc}"})
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib 命名
+            url = urlparse(self.path)
+            try:
+                if url.path in ("/snapshot/pause", "/snapshot/resume"):
+                    if engine.snapshot_manager is None:
+                        self._send(409, {"error": "快照后台写盘未启用"})
+                        return
+                    paused = url.path == "/snapshot/pause"
+                    engine.set_snapshot_paused(paused)
+                    # 暂停语义：暂停期间不构建任何 payload，恢复后由后续记录重新触发
+                    self._send(200, {"paused": paused, **engine.snapshot_status()})
+                else:
+                    self._send(404, {"error": "未知路径",
+                                     "paths": ["POST /snapshot/pause", "POST /snapshot/resume"]})
             except (ValueError, KeyError) as exc:
                 self._send(400, {"error": f"请求参数非法: {exc}"})
 
@@ -85,7 +116,13 @@ def _make_handler(engine: Engine, get_inflight: object):
 
 def run_service(args: argparse.Namespace) -> int:
     snapshot_store = SnapshotStore(args.state_dir)
-    engine = Engine(snapshot_store=snapshot_store)
+    # 后台快照写盘：账务线程只投递 payload，写盘慢/失败/暂停都不阻塞入账
+    snapshot_manager = (
+        SnapshotManager(snapshot_store) if args.snapshot_every > 0 else None
+    )
+    engine = Engine(
+        snapshot_store=snapshot_store, snapshot_manager=snapshot_manager
+    )
     journal = JournalWriter(f"{args.state_dir.rstrip('/')}/{BATCHES_NAME}")
 
     # 从上次已提交偏移继续跟读。committed_offset 是记录起始偏移，其行尾换行在
@@ -129,7 +166,11 @@ def run_service(args: argparse.Namespace) -> int:
         stop.set()
         httpd.shutdown()
         reader.join(timeout=2.0)
+        # 优雅停机：先补一次快照（若未暂停则入队），等后台写盘完成，再关批次日志。
+        # SIGKILL 时走不到这里也无妨：已 fsync 的批次日志仍是权威事实来源。
         engine.take_snapshot()
+        if snapshot_manager is not None:
+            snapshot_manager.close(flush=True)
         journal.close()
     return 0
 
