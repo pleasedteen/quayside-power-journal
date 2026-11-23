@@ -4,8 +4,10 @@
 以 JSON Lines 作为权威持久化，Parquet 仅作为分析侧的离线导出格式。
 
 导出两张表：
-  * ``<out>.batches.parquet``   每个批次一行（changes 等嵌套字段存为 JSON 字符串）
-  * ``<out>.windows.parquet``   每个窗口一行（窗口/泊位电量打平，一行一个泊位）
+  * ``<out>.batches.parquet``   每个批次一行（changes 等嵌套字段存为 JSON 字符串）；
+    seal 批次带 sealed_from/sealed_through 区间，空窗首封批次可归因
+  * ``<out>.windows.parquet``   每个窗口一行（窗口/泊位电量打平，一行一个泊位）；
+    sealed / sealed_by_seq 与在线窗口查询同源，可逐窗口核对同一首封批次
 """
 
 from __future__ import annotations
@@ -40,7 +42,9 @@ def export(state_dir: str, out_prefix: str) -> tuple[str, str]:
     else:
         pq.write_table(pa.table({"seq": pa.int64()}), batches_path)
 
-    # 窗口状态从批次日志重放得到，保证与服务视图一致
+    # 窗口状态从批次日志重放得到，保证与服务视图一致。
+    # sealed / sealed_by_seq 与在线查询同源：空窗（berth 为 NULL 的行）也能
+    # 与在线窗口查询核对同一个首次封账批次。
     from .engine import Engine
     from .storage import SnapshotStore
 
@@ -48,21 +52,26 @@ def export(state_dir: str, out_prefix: str) -> tuple[str, str]:
     window_rows: list[dict] = []
     for wstart in sorted(engine.windows):
         win = engine.windows[wstart]
+        sealed = engine.is_sealed(wstart)
+        sealed_by = engine.sealed_by_seq(wstart)
         if win["totals"]:
             for berth, energy in sorted(win["totals"].items()):
                 window_rows.append({
                     "window": format_ts(wstart), "window_start": wstart,
-                    "berth": berth, "energy": energy, "sealed": win["sealed"],
+                    "berth": berth, "energy": energy, "sealed": sealed,
+                    "sealed_by_seq": sealed_by,
                 })
         else:
             window_rows.append({
                 "window": format_ts(wstart), "window_start": wstart,
-                "berth": None, "energy": 0.0, "sealed": win["sealed"],
+                "berth": None, "energy": 0.0, "sealed": sealed,
+                "sealed_by_seq": sealed_by,
             })
     windows_path = f"{out_prefix}.windows.parquet"
     pq.write_table(pa.Table.from_pylist(
         window_rows or [{"window": None, "window_start": None,
-                         "berth": None, "energy": None, "sealed": None}]),
+                         "berth": None, "energy": None, "sealed": None,
+                         "sealed_by_seq": None}]),
         windows_path)
     return batches_path, windows_path
 

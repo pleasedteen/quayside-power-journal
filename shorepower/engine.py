@@ -2,6 +2,14 @@
 
 线程模型：只有服务线程调用 :meth:`Engine.process` 写状态；HTTP 查询线程通过
 同一把可重入锁读取，保证查询看到的是已持久化的一致状态。
+
+封账模型（schema 2）：全网关最慢水位 >= 窗口结束 + 10 分钟时，该窗口即被封账。
+引擎维护单调推进的封账水位 ``sealed_through``：所有窗口起点 <= 该水位的刻钟
+一律视为已封账——包括从未有读数的缺测空窗和被更正迁空的窗口，二者不再逐窗
+物化，而是由水位隐式覆盖（因此水位一次跨越大段空窗时，封账批次仍是常数大小）。
+每次水位推进发布一个 seal 批次，批次内只显式列出本批新封的“有状态”窗口
+（含被迁空的窗口）及其冻结电量；空窗的首次封账批次由 ``sealed_by_seq`` 按
+“首个 sealed_through 覆盖该窗口的 seal 批次”推得，查询与 Parquet 导出一致。
 """
 
 from __future__ import annotations
@@ -15,7 +23,6 @@ from .model import (
     Progress,
     Reading,
     SEAL_GRACE_SECONDS,
-    WINDOW_SECONDS,
     format_ts,
     parse_ts,
     seal_watermark_progress,
@@ -26,7 +33,8 @@ from .storage import SnapshotStore
 
 def _new_window() -> dict:
     # totals: 泊位 -> 当前电量；contributions: reading_id -> {berth, energy}
-    return {"sealed": False, "totals": {}, "contributions": {}}
+    # 窗口是否封账不由窗口自身记录，统一由引擎的封账水位判定
+    return {"totals": {}, "contributions": {}}
 
 
 class Engine:
@@ -37,11 +45,15 @@ class Engine:
         self.progress: dict[str, int] = {}
         # reading_id -> 当前生效版本 {gateway, berth, meter_ts, energy, version, offset}
         self.readings: dict[str, dict] = {}
-        # window_start -> {sealed, totals{berth: energy}, contributions{rid: {berth, energy}}}
+        # window_start -> {totals{berth: energy}, contributions{rid: {berth, energy}}}
+        # 只物化“有状态”窗口；缺测空窗不物化，由封账水位隐式覆盖
         self.windows: dict[int, dict] = {}
+        # 封账水位：窗口起点 <= sealed_through 的刻钟全部已封账（含空窗）；None 表示尚未封账
+        self.sealed_through: int | None = None
+        # 每次水位推进一条 {seq, sealed_through}，用于空窗的首封批次归因
+        self.seal_history: list[dict] = []
         self.batches: list[dict] = []
         self.committed_offset = -1
-        self.min_meter_ts: int | None = None
         self._since_snapshot = 0
         self.restore()
 
@@ -61,6 +73,24 @@ class Engine:
             win = _new_window()
             self.windows[start] = win
         return win
+
+    # ------------------------------------------------------------- 封账判定
+    def is_sealed(self, wstart: int) -> bool:
+        """窗口（含从未物化的空窗）是否已封账：窗口起点 <= 封账水位即已封。"""
+        return self.sealed_through is not None and wstart <= self.sealed_through
+
+    def sealed_by_seq(self, wstart: int) -> int | None:
+        """首次把该窗口封账的批次序号；未封账返回 None。
+
+        空窗不逐窗物化，其首封批次 = 首个 sealed_through 覆盖该窗口的 seal 批次；
+        有状态窗口在对应批次的 sealed_windows 中显式列出，二者同批，归因一致。
+        """
+        if not self.is_sealed(wstart):
+            return None
+        for entry in self.seal_history:  # 按 seq 升序，水位单调推进
+            if entry["sealed_through"] >= wstart:
+                return entry["seq"]
+        return None  # 防御：水位来自快照但批次日志缺失
 
     # ------------------------------------------------------------- 主入口
     def process(self, rec) -> list[dict]:
@@ -106,21 +136,16 @@ class Engine:
                 }
             )
         wstart = window_start(rec.meter_ts)
-        if self.windows.get(wstart, {}).get("sealed"):
+        if self.is_sealed(wstart):
             return self._publish(
                 base
                 | {
                     "status": "rejected",
-                    "reason": f"窗口 {format_ts(wstart)} 已封账，迟到读数不得入账",
+                    "reason": f"窗口 {format_ts(wstart)} 已封账，迟到读数不再补入电量",
                     "changes": [],
                 }
             )
         self.gateways.add(rec.gateway)
-        self.min_meter_ts = (
-            rec.meter_ts
-            if self.min_meter_ts is None
-            else min(self.min_meter_ts, rec.meter_ts)
-        )
         win = self._window(wstart)
         win["totals"][rec.berth] = win["totals"].get(rec.berth, 0.0) + rec.energy
         win["contributions"][rec.reading_id] = {"berth": rec.berth, "energy": rec.energy}
@@ -185,7 +210,7 @@ class Engine:
         new_start = window_start(rec.meter_ts)
         blocked = []
         for wstart in {old_start, new_start}:
-            if self.windows.get(wstart, {}).get("sealed"):
+            if self.is_sealed(wstart):
                 blocked.append(format_ts(wstart))
         if blocked:
             return self._publish(
@@ -250,11 +275,6 @@ class Engine:
                 "offset": rec.offset,
             }
         )
-        self.min_meter_ts = (
-            rec.meter_ts
-            if self.min_meter_ts is None
-            else min(self.min_meter_ts, rec.meter_ts)
-        )
         # 确定性顺序：窗口起点、泊位、变更类型（remove 在 add 前）
         order = {"remove": 0, "add": 1, "set": 2}
         changes.sort(key=lambda c: (c["window_start"], c["berth"], order[c["change"]]))
@@ -316,41 +336,51 @@ class Engine:
         return bool(self.gateways) and self.gateways.issubset(self.progress.keys())
 
     def _seal_due_windows(self, trigger_offset: int) -> dict | None:
-        if not self._all_gateways_reported() or self.min_meter_ts is None:
+        """水位推进封账水位，必要时发布一个 seal 批次。
+
+        封账水位从 ``sealed_from``（不含）推进到 ``sealed_through``（含）：
+        区间内缺测/被迁空的空窗一并封账且不再逐窗物化，因此水位一次跨过
+        任意长的无读数区间（哪怕连续一年），批次仍是常数大小；区间内
+        “有状态”窗口（含被迁空窗口）显式列出冻结电量，作为月报权威值。
+        """
+        if not self._all_gateways_reported():
             return None
         slowest = min(self.progress.values())
         top = seal_watermark_progress(slowest)
         if top < 0:
             return None
-        first = window_start(self.min_meter_ts)
-        sealed_now: list[dict] = []
-        wstart = first
-        while wstart <= top:
-            win = self.windows.get(wstart)
-            if win is None:
-                win = _new_window()
-                self.windows[wstart] = win
-            if not win["sealed"]:
-                win["sealed"] = True
-                sealed_now.append(
-                    {
-                        "window": format_ts(wstart),
-                        "window_start": wstart,
-                        "totals": dict(sorted(win["totals"].items())),
-                    }
-                )
-            wstart += WINDOW_SECONDS
-        if not sealed_now:
+        prev = self.sealed_through
+        if prev is not None and top <= prev:
             return None
-        return self._publish(
+        sealed_now: list[dict] = []
+        for wstart in sorted(self.windows):
+            if wstart > top:
+                break
+            if prev is not None and wstart <= prev:
+                continue  # 更早批次已封
+            win = self.windows[wstart]
+            sealed_now.append(
+                {
+                    "window": format_ts(wstart),
+                    "window_start": wstart,
+                    "totals": dict(sorted(win["totals"].items())),
+                }
+            )
+        batch = self._publish(
             {
                 "kind": "seal",
                 "trigger_offset": trigger_offset,
                 "watermark_progress": format_ts(slowest),
                 "grace_seconds": SEAL_GRACE_SECONDS,
+                # 上一封账水位（本批不含）；None 表示首次推进，此前全部空窗一并封账
+                "sealed_from": prev,
+                "sealed_through": top,
                 "sealed_windows": sealed_now,
             }
         )
+        self.seal_history.append({"seq": batch["seq"], "sealed_through": top})
+        self.sealed_through = top
+        return batch
 
     # ------------------------------------------------------------- 查询
     def query_windows(self, window_ids: list[str] | None = None) -> dict:
@@ -360,13 +390,19 @@ class Engine:
                 "seal_grace_seconds": SEAL_GRACE_SECONDS,
                 "slowest_progress": format_ts(slowest) if slowest is not None else None,
                 "all_gateways_reported": self._all_gateways_reported(),
+                # 封账水位：<= 该值的刻钟（含缺测/迁空空窗）全部已封账
+                "sealed_through": (
+                    format_ts(self.sealed_through)
+                    if self.sealed_through is not None
+                    else None
+                ),
                 "windows": [],
             }
             if window_ids:
                 starts = []
                 for wid in window_ids:
                     try:
-                        starts.append(parse_ts(wid, "window"))
+                        starts.append(window_start(parse_ts(wid, "window")))
                     except Exception:
                         starts.append(None)
                 items = [(s, self.windows.get(s) if s is not None else None) for s in starts]
@@ -378,27 +414,22 @@ class Engine:
                         {"window": None, "error": "窗口标识无法解析为 UTC 时间"}
                     )
                     continue
+                sealed = self.is_sealed(wstart)
+                entry = {
+                    "window": format_ts(wstart),
+                    "window_start": wstart,
+                    "sealed": sealed,
+                    # 首封批次序号：区分「待封账零电量」（null）与「已封账零电量」，
+                    # 并与 Parquet 导出的同一字段逐窗口核对
+                    "sealed_by_seq": self.sealed_by_seq(wstart) if sealed else None,
+                }
                 if win is None:
-                    result["windows"].append(
-                        {
-                            "window": format_ts(wstart),
-                            "window_start": wstart,
-                            "sealed": False,
-                            "totals": {},
-                            "total_energy": 0.0,
-                        }
-                    )
-                    continue
-                totals = dict(sorted(win["totals"].items()))
-                result["windows"].append(
-                    {
-                        "window": format_ts(wstart),
-                        "window_start": wstart,
-                        "sealed": win["sealed"],
-                        "totals": totals,
-                        "total_energy": sum(totals.values()),
-                    }
-                )
+                    # 未物化的空窗：sealed 由水位给出，零电量同样区分两态
+                    entry |= {"totals": {}, "total_energy": 0.0}
+                else:
+                    totals = dict(sorted(win["totals"].items()))
+                    entry |= {"totals": totals, "total_energy": sum(totals.values())}
+                result["windows"].append(entry)
             return result
 
     def query_batches(self, after_seq: int = 0, limit: int | None = None) -> dict:
@@ -414,7 +445,7 @@ class Engine:
 
     def stats(self, inflight: int = 0) -> dict:
         with self.lock:
-            sealed = sum(1 for w in self.windows.values() if w["sealed"])
+            sealed = sum(1 for w in self.windows if self.is_sealed(w))
             return {
                 "published_batches": len(self.batches),
                 "last_seq": self.batches[-1]["seq"] if self.batches else 0,
@@ -425,6 +456,12 @@ class Engine:
                 "tracked_readings": len(self.readings),
                 "windows_total": len(self.windows),
                 "windows_sealed": sealed,
+                "sealed_through": (
+                    format_ts(self.sealed_through)
+                    if self.sealed_through is not None
+                    else None
+                ),
+                "seal_batches": len(self.seal_history),
             }
 
     # ----------------------------------------------------- 快照与崩溃恢复
@@ -444,21 +481,27 @@ class Engine:
                 "readings": self.readings,
                 "windows": {
                     str(k): {
-                        "sealed": v["sealed"],
                         "totals": v["totals"],
                         "contributions": v["contributions"],
                     }
                     for k, v in self.windows.items()
                 },
+                "sealed_through": self.sealed_through,
+                "seal_history": self.seal_history,
                 "next_seq": len(self.batches) + 1,
                 "committed_offset": self.committed_offset,
-                "min_meter_ts": self.min_meter_ts,
             }
             self.snapshot_store.write(payload)
             self._since_snapshot = 0
 
     def restore(self) -> None:
-        """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。"""
+        """从快照 + 批次日志重建状态。快照只可能早于日志，重复回放部分天然幂等跳过。
+
+        兼容 schema 1：旧快照的逐窗 sealed 标志折算为封账水位（旧逻辑封账区间
+        连续，最大已封窗口起点即水位）；旧格式 seal 批次（无 sealed_through）
+        以其列表中最大窗口起点为水位。无论新旧，封账后的冻结电量都以批次
+        日志中的权威值重放，旧批次内容不被改写。
+        """
         store = self.snapshot_store
         if store is None:
             return
@@ -473,24 +516,50 @@ class Engine:
             return
 
         if snap is not None:
-            if snap.get("schema") != SCHEMA_VERSION:
-                raise ValueError(f"不支持的快照 schema: {snap.get('schema')!r}")
+            schema = snap.get("schema")
+            if schema not in (1, SCHEMA_VERSION):
+                raise ValueError(f"不支持的快照 schema: {schema!r}")
             self.gateways = set(snap["gateways"])
             self.progress = dict(snap["progress"])
             self.readings = {k: dict(v) for k, v in snap["readings"].items()}
             self.windows = {
                 int(k): {
-                    "sealed": v["sealed"],
                     "totals": dict(v["totals"]),
                     "contributions": {rid: dict(c) for rid, c in v["contributions"].items()},
                 }
                 for k, v in snap["windows"].items()
             }
             self.committed_offset = snap["committed_offset"]
-            self.min_meter_ts = snap.get("min_meter_ts")
+            if schema >= 2:
+                self.sealed_through = snap.get("sealed_through")
+                self.seal_history = [dict(h) for h in snap.get("seal_history", [])]
+            else:
+                # v1 快照：逐窗 sealed 标志折算为封账水位
+                sealed_starts = [
+                    int(k) for k, v in snap["windows"].items() if v.get("sealed")
+                ]
+                self.sealed_through = max(sealed_starts) if sealed_starts else None
+                self.seal_history = []
             snap_seq = snap["next_seq"] - 1
         else:
             snap_seq = 0
+
+        # 封账水位与首封批次归因：批次日志是权威来源，全量扫描重建
+        history: list[dict] = []
+        for batch in replayed_batches:
+            if batch.get("kind") != "seal":
+                continue
+            through = batch.get("sealed_through")
+            if through is None:  # v1 批次：封到列表中最大窗口起点
+                through = max(
+                    (item["window_start"] for item in batch.get("sealed_windows", [])),
+                    default=None,
+                )
+            if through is not None:
+                history.append({"seq": batch["seq"], "sealed_through": through})
+        if history:  # 日志按 seq 升序，水位单调，末条即当前水位
+            self.seal_history = history
+            self.sealed_through = history[-1]["sealed_through"]
 
         for batch in replayed_batches:
             if batch["seq"] <= snap_seq:
@@ -506,21 +575,19 @@ class Engine:
                     for b in replayed_batches
                 ),
             )
-        # readings 是权威的当前生效版本集合，水位扫描起点直接由其重算
-        if self.readings:
-            self.min_meter_ts = min(r["meter_ts"] for r in self.readings.values())
 
     def _replay_batch(self, batch: dict) -> None:
         """把批次日志中的一条变更重放进内存（不再次发布）。"""
         kind = batch["kind"]
         if kind == "seal":
-            for item in batch["sealed_windows"]:
+            # 新旧格式都只显式列出“有状态”窗口；空窗由水位隐式覆盖，
+            # 水位与归因历史已在 restore 中从全量日志重建，这里只落冻结电量
+            for item in batch.get("sealed_windows", []):
                 wstart = item["window_start"]
                 win = self.windows.get(wstart)
                 if win is None:
                     win = _new_window()
                     self.windows[wstart] = win
-                win["sealed"] = True
                 # 封账时的 totals 是权威冻结值
                 win["totals"] = dict(item["totals"])
             return

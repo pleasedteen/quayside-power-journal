@@ -9,6 +9,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .model import format_ts
+
 
 def _get(base: str, path: str, params: list[tuple[str, str]] | None = None) -> dict:
     url = base.rstrip("/") + path
@@ -27,12 +29,20 @@ def _get(base: str, path: str, params: list[tuple[str, str]] | None = None) -> d
 def _print_windows(payload: dict) -> None:
     print(f"全网关已上报进度: {payload['all_gateways_reported']}  "
           f"最慢水位: {payload['slowest_progress']}  "
-          f"封账宽限: {payload['seal_grace_seconds']}s")
+          f"封账宽限: {payload['seal_grace_seconds']}s  "
+          f"封账水位: {payload.get('sealed_through')}")
     for w in payload["windows"]:
         if "error" in w:
             print(f"  [错误] {w['error']}")
             continue
-        mark = "已封账" if w["sealed"] else "开放中"
+        if w["sealed"]:
+            # 已封账：空窗（零电量）与有电量窗口都冻结，标注首封批次便于核对
+            mark = "已封账·空窗" if not w["totals"] else "已封账"
+            if w.get("sealed_by_seq") is not None:
+                mark += f"(首封批次#{w['sealed_by_seq']})"
+        else:
+            # 待封账：零电量仍可能被迟到读数/更正改写
+            mark = "待封账·空窗" if not w["totals"] else "开放中"
         details = ", ".join(f"{berth}={energy}" for berth, energy in w["totals"].items()) or "-"
         print(f"  {w['window']}  [{mark}]  合计={w['total_energy']}  分泊位: {details}")
 
@@ -42,9 +52,18 @@ def _print_batches(payload: dict) -> None:
           f"本批返回 {len(payload['batches'])} 条")
     for b in payload["batches"]:
         if b["kind"] == "seal":
-            wins = ", ".join(w["window"] for w in b["sealed_windows"])
-            print(f"  #{b['seq']:>4} SEAL   触发偏移={b['trigger_offset']} "
-                  f"水位={b['watermark_progress']}(+{b['grace_seconds']}s) 封账: {wins}")
+            wins = ", ".join(w["window"] for w in b["sealed_windows"]) or "（无物化窗口）"
+            if "sealed_through" in b:
+                # schema 2：封账水位区间 (sealed_from, sealed_through]，空窗隐式覆盖
+                frm = b["sealed_from"]
+                frm_txt = format_ts(frm) if frm is not None else "起点"
+                print(f"  #{b['seq']:>4} SEAL   触发偏移={b['trigger_offset']} "
+                      f"水位={b['watermark_progress']}(+{b['grace_seconds']}s) "
+                      f"封账水位 {frm_txt} -> {format_ts(b['sealed_through'])}  "
+                      f"物化窗口: {wins}")
+            else:  # 旧格式批次（逐窗列举）
+                print(f"  #{b['seq']:>4} SEAL   触发偏移={b['trigger_offset']} "
+                      f"水位={b['watermark_progress']}(+{b['grace_seconds']}s) 封账: {wins}")
             continue
         status = b["status"].upper()
         if b["record_type"] == "bad":

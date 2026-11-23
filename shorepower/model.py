@@ -20,7 +20,9 @@ from typing import Any
 WINDOW_SECONDS = 15 * 60
 # 封账宽限：最慢网关水位超过窗口结束 10 分钟后封账
 SEAL_GRACE_SECONDS = 10 * 60
-SCHEMA_VERSION = 1
+# schema 2：封账改为单调水位（sealed_through）语义，空窗由水位隐式封账；
+# 引擎恢复时兼容 schema 1 的快照与旧格式封账批次
+SCHEMA_VERSION = 2
 
 
 class RecordError(ValueError):
